@@ -375,3 +375,23 @@ def get_cutting_service() -> CuttingOptimizationService:
     if _service_instance is None:
         _service_instance = CuttingOptimizationService()
     return _service_instance
+
+def reconstruct_block_from_data(block_data):
+    from planner.modules.trapezoidal_packing import BigBlock
+    from planner.modules.prism import Prism
+
+    block = BigBlock(
+        size=block_data["size"],
+        start_coord=block_data["start_coord"]
+    )
+
+    for prism_info in block_data.get("prisms", []):
+        prism = Prism(
+            code=prism_info["code"],
+            size=prism_info["size"]
+        )
+
+        for coord in prism_info["coordinates"]:
+            block.add_prism(prism, coord)
+
+    return block

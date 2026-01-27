@@ -368,7 +368,7 @@ def draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edge
     )
 
     
-    fig.show()
+    # fig.show()
 
     
 import numpy as np
@@ -451,6 +451,7 @@ def get_scrap_vol(end_coordinates, Block_size, st_co= [0,0,0], co_ordinates_list
     num_z_cond = num_z == 1 or num_z == 2 or num_z == 3
     
     if  not num_x_cond or not num_y_cond or not num_z_cond or not num_cond:
+        assert False
         big_block_coordinate = place_box(st_co, Block_size[0], Block_size[1], Block_size[2])
         draw(big_block_coordinate, co_ordinates_list , x_edges= edges['x_edges'], y_edges= edges['y_edges'], z_edges=edges['z_edges'], 
              planes={"xy_planes":[],"zx_planes":[],"yz_planes":[],}, scrap_volumes =[])

@@ -8,6 +8,7 @@ GLOBAL_OPTIMIZATION_STATE = {
 """
 API views for the cutting optimization planner.
 """
+from datetime import datetime
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
@@ -49,7 +50,7 @@ from .services import get_cutting_service
 # Import from your new modules
 try:
     from .modules.packing_module import OptimizationEngine, pack_trapezoidal_prisms as new_pack_trapezoidal_prisms
-    from .modules.packing_orchestrator import Prisms, run_final_code, get_block_details
+    from .modules.packing_orchestrator import Prisms, run_final_code, get_block_details, run_optimization_with_retries
 except ImportError as e:
     print(f"Warning: Could not import packing modules: {e}")
     OptimizationEngine = None
@@ -252,52 +253,66 @@ def generate_block_visualization(request, block_code):
     try:
         from django.conf import settings
         from django.core.cache import cache
-        from datetime import datetime
-        import os, time
-
-        # 🔒 Wait for helper (Gunicorn-safe)
-        helper = None
-        for _ in range(20):
-            helper = cache.get("latest_helper")
-            if helper is not None:
-                break
-            time.sleep(0.2)
-
+        import os
+        
+        helper = cache.get("latest_helper")
         if helper is None:
             return Response({
                 "success": False,
-                "error": "Optimization data not ready. Please retry."
+                "error": "Optimization data not ready. Please run optimization first."
             }, status=400)
-
-        block_index = int(block_code.replace("B", "")) - 1
-
-        if block_index < 0 or block_index >= len(helper.all_big_blocks):
+        
+        # Find the block
+        block = None
+        for b in helper.all_big_blocks:
+            if b.unique_code == block_code:
+                block = b
+                break
+        
+        if block is None:
+            # Try by index
+            try:
+                block_index = int(block_code.replace("B", "")) - 1
+                if 0 <= block_index < len(helper.all_big_blocks):
+                    block = helper.all_big_blocks[block_index]
+            except:
+                pass
+        
+        if block is None:
             return Response({
                 "success": False,
-                "error": "Invalid block code"
-            }, status=400)
-
-        block = helper.all_big_blocks[block_index]
-
+                "error": f"Block {block_code} not found"
+            }, status=404)
+        
+        # Create visualization directory
         viz_dir = os.path.join(settings.MEDIA_ROOT, "visualizations")
         os.makedirs(viz_dir, exist_ok=True)
-
+        
+        # Generate visualization
         filename = f"block_{block.unique_code}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
         filepath = os.path.join(viz_dir, filename)
-
-        block.draw_it(only_scrap=False, save_path=filepath)
-
-        # ⏳ wait for file write
-        for _ in range(30):
-            if os.path.exists(filepath) and os.path.getsize(filepath) > 1024:
-                break
-            time.sleep(0.1)
-
+        
+        try:
+            # FIX: Pass save_path parameter to actually save the file
+            block.draw_it(only_scrap=False, save_path=filepath)
+            
+            # Verify the file was created
+            if not os.path.exists(filepath):
+                raise Exception(f"Visualization file not created at {filepath}")
+                
+        except Exception as draw_error:
+            print(f"Error drawing block: {draw_error}")
+            return Response({
+                "success": False,
+                "error": f"Could not generate visualization: {draw_error}"
+            }, status=500)
+        
         return Response({
             "success": True,
-            "visualization_url": f"/media/visualizations/{filename}"
+            "visualization_url": f"/media/visualizations/{filename}",
+            "message": f"Visualization generated for block {block.unique_code}"
         })
-
+        
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -305,7 +320,6 @@ def generate_block_visualization(request, block_code):
             "success": False,
             "error": str(e)
         }, status=500)
-
 
 
 
@@ -408,7 +422,7 @@ def get_visualization_file(request, filename):
 @permission_classes([IsAuthenticated])
 def upload_and_optimize(request):
     """
-    Upload Excel file and run optimization with custom parent blocks
+    Upload Excel file and run optimization with custom parent blocks and retry logic
     
     POST /api/upload-optimize/
     Content-Type: multipart/form-data
@@ -418,14 +432,27 @@ def upload_and_optimize(request):
     - selected_blocks: JSON array of selected block IDs (optional)
     - parent_blocks: JSON array of parent block sizes (required)
     - buffer_spacing: float (default: 2.0)
+    - max_retries: int (default: 1000, optional)
+    - retry_enabled: bool (default: True, optional)
     """
     try:
         from django.utils import timezone
         from django.core.cache import cache
+        from django.conf import settings
+        import json
+        import pandas as pd
+        import os
+        import tempfile
+        import traceback
+        import shutil
         
         # ====================
         # 1. VALIDATE INPUTS
         # ====================
+        print(f"\n=== OPTIMIZATION REQUEST STARTED ===")
+        print(f"User: {request.user.username}")
+        print(f"Timestamp: {timezone.now().isoformat()}")
+        
         # Get uploaded file
         excel_file = request.FILES.get('file')
         if not excel_file:
@@ -438,6 +465,8 @@ def upload_and_optimize(request):
         selected_blocks_json = request.POST.get('selected_blocks', '[]')
         parent_blocks_json = request.POST.get('parent_blocks', '[]')
         buffer_spacing = float(request.POST.get('buffer_spacing', '2.0'))
+        max_retries = int(request.POST.get('max_retries', '1500'))
+        retry_enabled = request.POST.get('retry_enabled', 'true').lower() == 'true'
         
         try:
             selected_blocks = json.loads(selected_blocks_json)
@@ -448,12 +477,12 @@ def upload_and_optimize(request):
                 'error': f'Invalid JSON in parameters: {str(e)}'
             }, status=400)
         
-        print(f"\n=== OPTIMIZATION REQUEST ===")
-        print(f"User: {request.user.username}")
-        print(f"File: {excel_file.name}")
-        print(f"Selected blocks: {selected_blocks}")
-        print(f"Parent blocks: {parent_blocks_data}")
+        print(f"File: {excel_file.name} ({(excel_file.size/1024):.2f} KB)")
+        print(f"Selected blocks: {len(selected_blocks)} items")
+        print(f"Parent blocks data count: {len(parent_blocks_data)}")
         print(f"Buffer spacing: {buffer_spacing}")
+        print(f"Max retries: {max_retries}")
+        print(f"Retry enabled: {retry_enabled}")
         
         # ====================
         # 2. PROCESS PARENT BLOCKS
@@ -461,30 +490,54 @@ def upload_and_optimize(request):
         parent_block_sizes = []
         parent_labels = []
         
-        # Handle the format sent from frontend
-        for block in parent_blocks_data:
-            if isinstance(block, dict):
-                # Format: {"label": "800×350×1870", "dimensions": {"length": 1870, "width": 800, "height": 350}}
-                if 'dimensions' in block:
-                    dims = block['dimensions']
-                    parent_block_sizes.append([
-                        dims.get('length', 0),
-                        dims.get('width', 0),
-                        dims.get('height', 0)
-                    ])
-                    parent_labels.append(block.get('label', f'Block_{len(parent_block_sizes)}'))
-                # Format: {"length": 1870, "width": 800, "height": 350}
-                elif 'length' in block and 'width' in block and 'height' in block:
-                    parent_block_sizes.append([
-                        block['length'],
-                        block['width'],
-                        block['height']
-                    ])
-                    parent_labels.append(f"{block['length']}×{block['width']}×{block['height']}")
-            elif isinstance(block, list) and len(block) == 3:
-                # Format: [1870, 800, 350]
-                parent_block_sizes.append(block)
-                parent_labels.append(f"{block[0]}×{block[1]}×{block[2]}")
+        if not parent_blocks_data:
+            return Response({
+                'success': False,
+                'error': 'No parent blocks provided'
+            }, status=400)
+        
+        for i, block in enumerate(parent_blocks_data):
+            try:
+                if isinstance(block, dict):
+                    # Format: {"label": "800×350×1870", "dimensions": {"length": 1870, "width": 800, "height": 350}}
+                    if 'dimensions' in block:
+                        dims = block['dimensions']
+                        length = float(dims.get('length', 0))
+                        width = float(dims.get('width', 0))
+                        height = float(dims.get('height', 0))
+                    # Format: {"length": 1870, "width": 800, "height": 350}
+                    elif 'length' in block and 'width' in block and 'height' in block:
+                        length = float(block['length'])
+                        width = float(block['width'])
+                        height = float(block['height'])
+                    else:
+                        print(f"Warning: Parent block {i} has invalid format: {block}")
+                        continue
+                
+                elif isinstance(block, list) and len(block) == 3:
+                    # Format: [1870, 800, 350]
+                    length = float(block[0])
+                    width = float(block[1])
+                    height = float(block[2])
+                else:
+                    print(f"Warning: Parent block {i} has invalid format: {block}")
+                    continue
+                
+                # Validate dimensions
+                if length <= 0 or width <= 0 or height <= 0:
+                    print(f"Warning: Parent block {i} has non-positive dimensions: {length}x{width}x{height}")
+                    continue
+                
+                # Add to lists
+                parent_block_sizes.append([length, width, height])
+                label = block.get('label', f'{length}×{width}×{height}') if isinstance(block, dict) else f'{length}×{width}×{height}'
+                parent_labels.append(label)
+                
+                print(f"Added parent block: {label} = [{length}, {width}, {height}]")
+                
+            except Exception as e:
+                print(f"Error processing parent block {i}: {e}")
+                continue
         
         if not parent_block_sizes:
             return Response({
@@ -492,41 +545,99 @@ def upload_and_optimize(request):
                 'error': 'No valid parent blocks provided'
             }, status=400)
         
-        # Validate dimensions
-        for i, size in enumerate(parent_block_sizes):
-            if len(size) != 3:
-                return Response({
-                    'success': False,
-                    'error': f'Parent block {i}: Must have exactly 3 dimensions (length, width, height)'
-                }, status=400)
-            
-            length, width, height = size
-            if length <= 0 or width <= 0 or height <= 0:
-                return Response({
-                    'success': False,
-                    'error': f'Parent block {i}: All dimensions must be positive'
-                }, status=400)
-        
         print(f"Parent block sizes to use: {parent_block_sizes}")
         print(f"Parent block labels: {parent_labels}")
         
         # ====================
         # 3. PROCESS EXCEL FILE
         # ====================
-        if OptimizationEngine is None:
+        print(f"\nProcessing Excel file...")
+        
+        try:
+            # Read the Excel file
+            if excel_file.name.lower().endswith('.csv'):
+                df = pd.read_csv(excel_file)
+            else:
+                df = pd.read_excel(excel_file, engine='openpyxl')
+            
+            print(f"Excel file loaded: {df.shape[0]} rows, {df.shape[1]} columns")
+            print(f"Columns: {df.columns.tolist()}")
+            
+        except Exception as e:
+            print(f"Error reading Excel file: {str(e)}")
+            traceback.print_exc()
             return Response({
                 'success': False,
-                'error': 'Optimization engine not available'
-            }, status=500)
+                'error': f'Error reading Excel file: {str(e)}'
+            }, status=400)
         
-        engine = OptimizationEngine(
-            stock_dimensions={'length': 2000, 'width': 500, 'height': 500},
-            parts_data=[],
-            buffer_spacing=buffer_spacing
-        )
+        # Clean column names
+        df.columns = [str(col).strip() for col in df.columns]
         
-        # Process Excel data
-        parts_data = engine.process_excel_data(excel_file)
+        # Define expected columns and their possible variations
+        column_mapping = {}
+        for col in df.columns:
+            col_lower = str(col).lower()
+            
+            if 'mark' in col_lower or 'code' in col_lower:
+                column_mapping[col] = 'MARK'
+            elif 'bottom' in col_lower and 'length' in col_lower:
+                column_mapping[col] = 'Bottom Length'
+            elif 'top' in col_lower and 'length' in col_lower:
+                column_mapping[col] = 'Top Length'
+            elif 'width' in col_lower or 'breadth' in col_lower or 'w' == col_lower:
+                column_mapping[col] = 'Width'
+            elif 'height' in col_lower or 'thickness' in col_lower or 'depth' in col_lower or 'h' == col_lower:
+                column_mapping[col] = 'Height'
+            elif 'nos' in col_lower or 'quantity' in col_lower or 'qty' in col_lower or 'count' in col_lower:
+                column_mapping[col] = 'Nos'
+        
+        # Apply mapping
+        df.rename(columns=column_mapping, inplace=True)
+        
+        print(f"After column mapping: {df.columns.tolist()}")
+        
+        # Check for required columns
+        required_columns = ['MARK', 'Bottom Length', 'Top Length', 'Width', 'Height', 'Nos']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            print(f"Missing columns: {missing_columns}")
+            return Response({
+                'success': False,
+                'error': f'Missing required columns: {", ".join(missing_columns)}'
+            }, status=400)
+        
+        # Process each row
+        parts_data = []
+        for index, row in df.iterrows():
+            try:
+                # Skip empty rows
+                mark_value = row.get('MARK')
+                if pd.isna(mark_value) or str(mark_value).strip() == '':
+                    continue
+                
+                # Extract and clean data
+                part = {
+                    'MARK': str(mark_value).strip(),
+                    'Bottom Length': float(row.get('Bottom Length', 0)),
+                    'Top Length': float(row.get('Top Length', 0)),
+                    'Width': float(row.get('Width', 0)),
+                    'Height': float(row.get('Height', 0)),
+                    'Nos': int(float(row.get('Nos', 0)))
+                }
+                
+                # Validate data
+                if (part['Bottom Length'] <= 0 or part['Top Length'] <= 0 or 
+                    part['Width'] <= 0 or part['Height'] <= 0 or part['Nos'] <= 0):
+                    print(f"Warning: Row {index} has invalid dimensions or quantity: {part}")
+                    continue
+                
+                parts_data.append(part)
+                
+            except Exception as e:
+                print(f"Warning: Error processing row {index}: {e}")
+                continue
         
         if not parts_data:
             return Response({
@@ -534,7 +645,7 @@ def upload_and_optimize(request):
                 'error': 'No valid data found in Excel file'
             }, status=400)
         
-        print(f"Processed {len(parts_data)} parts from Excel")
+        print(f"Successfully processed {len(parts_data)} parts from Excel")
         
         # Filter selected blocks if specified
         original_part_count = len(parts_data)
@@ -543,208 +654,357 @@ def upload_and_optimize(request):
             print(f"Filtered to {len(parts_data)} selected parts (from {original_part_count})")
         
         # ====================
-        # 4. CREATE PRISM OBJECTS
+        # 4. PREPARE DATA FOR OPTIMIZATION
         # ====================
-        if Prisms is None or run_final_code is None:
-            return Response({
-                'success': False,
-                'error': 'Packing modules not available'
-            }, status=500)
+        print(f"\nPreparing data for optimization...")
         
-        all_prisms = []
-        prism_summary = []
+        # Create a temporary Excel file with filtered data
+        temp_file_path = None
         
-        for part in parts_data:
-            try:
-                size = [
-                    part['Bottom Length'],
-                    part['Top Length'],
-                    part['Width'],
-                    part['Height']
-                ]
-                prism = Prisms(
-                    code=part['MARK'],
-                    size=size,
-                    quantity=part['Nos']
-                )
-                all_prisms.append(prism)
-                prism_summary.append({
-                    'code': part['MARK'],
-                    'quantity': part['Nos'],
-                    'bottom_length': part['Bottom Length'],
-                    'top_length': part['Top Length'],
-                    'width': part['Width'],
-                    'height': part['Height']
-                })
-            except Exception as e:
-                print(f"Error creating prism {part.get('MARK', 'Unknown')}: {e}")
-                continue
-        
-        if not all_prisms:
-            return Response({
-                'success': False,
-                'error': 'No valid prism objects created'
-            }, status=400)
-        
-        print(f"Created {len(all_prisms)} prism objects")
-        
-        # ====================
-        # 5. RUN PACKING ALGORITHM
-        # ====================
         try:
-            print(f"Running packing algorithm with {len(all_prisms)} prisms and {len(parent_block_sizes)} parent block sizes...")
-            helper = run_final_code(
-                all_prisms=all_prisms,
-                buffer=buffer_spacing,
-                parent_block_sizes=parent_block_sizes
-            )
+            # Create a temporary directory for the Excel file
+            temp_dir = os.path.join(settings.MEDIA_ROOT, 'temp_uploads')
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            # Generate a unique filename
+            import uuid
+            temp_filename = f"optimization_{uuid.uuid4().hex[:8]}_{excel_file.name}"
+            temp_file_path = os.path.join(temp_dir, temp_filename)
+            
+            # Save filtered data to Excel
+            df_filtered = pd.DataFrame(parts_data)
+            if excel_file.name.lower().endswith('.csv'):
+                df_filtered.to_csv(temp_file_path, index=False)
+            else:
+                df_filtered.to_excel(temp_file_path, index=False, engine='openpyxl')
+            
+            print(f"Created temporary file: {temp_file_path}")
+            print(f"Temporary file size: {(os.path.getsize(temp_file_path)/1024):.2f} KB")
+            
+        except Exception as e:
+            print(f"Error creating temporary file: {e}")
+            # Continue without temporary file - we'll use direct approach
+            
+        # ====================
+        # 5. RUN OPTIMIZATION WITH RETRY LOGIC
+        # ====================
+        print(f"\nRunning optimization with retry logic...")
+        print(f"- Total prisms: {len(parts_data)}")
+        print(f"- Parent block sizes: {len(parent_block_sizes)} options")
+        print(f"- Buffer spacing: {buffer_spacing}")
+        print(f"- Max retries: {max_retries}")
+        print(f"- Retry enabled: {retry_enabled}")
+        
+        optimization_start_time = timezone.now()
+        helper = None
+        block_details = None
+        
+        try:
+            if retry_enabled and temp_file_path and os.path.exists(temp_file_path):
+                # Use the new run_optimization_with_retries function
+                print(f"Using run_optimization_with_retries with max_tries={max_retries}")
+                
+                # Ensure we have the function imported
+                from .modules.packing_orchestrator import run_optimization_with_retries
+                
+                helper, block_details = run_optimization_with_retries(
+                    excel_path=temp_file_path,
+                    parent_block_sizes=parent_block_sizes,
+                    buffer=buffer_spacing,
+                    max_tries=max_retries
+                )
+                
+                print(f"Optimization completed after retries")
+                
+            else:
+                # Use the original direct approach without retries
+                print(f"Using direct optimization approach (no retries)")
+                
+                # Create prism objects
+                all_prisms = []
+                for part in parts_data:
+                    try:
+                        size = [
+                            part['Bottom Length'],
+                            part['Top Length'],
+                            part['Width'],
+                            part['Height']
+                        ]
+                        
+                        prism = Prisms(
+                            code=part['MARK'],
+                            size=size,
+                            quantity=part['Nos']
+                        )
+                        
+                        all_prisms.append(prism)
+                        
+                        print(f"Created prism: {part['MARK']} - {part['Nos']} units, Volume: {prism.get_volume():.2f}")
+                        
+                    except Exception as e:
+                        print(f"Error creating prism {part.get('MARK', 'Unknown')}: {e}")
+                        continue
+                
+                if not all_prisms:
+                    raise Exception('No valid prism objects created from the data')
+                
+                # Sort prisms by volume (largest first for better packing)
+                prism_list_sorted = sorted(all_prisms, key=lambda p: p.get_volume(), reverse=True)
+                
+                # Run the optimization
+                helper = run_final_code(
+                    all_prisms=prism_list_sorted,
+                    buffer=buffer_spacing,
+                    parent_block_sizes=parent_block_sizes
+                )
+                
+                if helper is None:
+                    raise Exception("Packing algorithm returned None")
+                
+                # Get block details
+                block_details = get_block_details(helper)
+                
+            if helper is None:
+                raise Exception("Optimization failed - no helper object returned")
+            
+            print(f"Optimization successful!")
+            print(f"- Total blocks created: {len(helper.all_big_blocks)}")
+            print(f"- Total scraps generated: {len(helper.all_scrap)}")
             
             # Store helper in cache for visualization
             cache.set(
                 "latest_helper",
                 helper,
-                timeout=60 * 60  # 1 hour
+                timeout=60 * 60 * 2  # 2 hours
             )
-            print(f"Packing complete! Cached helper for visualizations.")
-
+            # print(f"Cached helper for visualizations.")
+            
         except Exception as e:
-            print(f"ERROR in run_final_code: {str(e)}")
-            import traceback
+            print(f"ERROR in optimization: {str(e)}")
             traceback.print_exc()
+            
+            # Clean up temporary file
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                    print(f"Cleaned up temporary file: {temp_file_path}")
+                except:
+                    pass
+            
             return Response({
                 'success': False,
-                'error': f'Packing algorithm failed: {str(e)}'
+                'error': f'Optimization failed: {str(e)}'
             }, status=500)
+        
+        # Clean up temporary file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+                print(f"Cleaned up temporary file: {temp_file_path}")
+            except Exception as e:
+                print(f"Warning: Could not delete temporary file: {e}")
         
         # ====================
         # 6. PREPARE RESULTS
         # ====================
-        if get_block_details is None:
-            return Response({
-                'success': False,
-                'error': 'Block details module not available'
-            }, status=500)
+        print(f"\nPreparing results...")
+        optimization_end_time = timezone.now()
+        optimization_duration = (optimization_end_time - optimization_start_time).total_seconds()
         
-        block_details = get_block_details(helper)
-        
-        print(f"Total blocks created: {len(helper.all_big_blocks)}")
-        print(f"Total scraps: {len(helper.all_scrap)}")
-        
-        # Calculate totals
-        total_parts_packed = 0
-        total_prism_volume = 0
-        total_requested = 0
-        
-        for prism in all_prisms:
-            packed = prism.quantity - prism.prism_left
-            total_parts_packed += packed
-            total_prism_volume += prism.volume * packed
-            total_requested += prism.quantity
-        
-        # Calculate total stock volume
-        total_stock_volume = 0
-        for block in helper.all_big_blocks:
-            total_stock_volume += block.volume
-        
-        # Calculate efficiency
-        if total_stock_volume > 0:
-            efficiency = (total_prism_volume / total_stock_volume) * 100
-        else:
+        try:
+            # If block_details wasn't provided by run_optimization_with_retries, generate it
+            if block_details is None:
+                block_details = get_block_details(helper)
+            
+            # Calculate totals
+            total_parts_packed = 0
+            total_prism_volume = 0
+            total_requested = 0
+            
+            # Calculate total requested from parts_data
+            for part in parts_data:
+                total_requested += part['Nos']
+            
+            # Calculate packed parts and volumes from block_details
+            if block_details and 'blocks' in block_details:
+                for block in block_details['blocks']:
+                    if 'prisms' in block:
+                        for prism_info in block['prisms']:
+                            # Find the prism in parts_data to get volume
+                            for part in parts_data:
+                                if part['MARK'] == prism_info['code']:
+                                    prism_volume = 0.5 * (part['Bottom Length'] + part['Top Length']) * part['Width'] * part['Height']
+                                    total_parts_packed += prism_info.get('number', 0)
+                                    total_prism_volume += prism_volume * prism_info.get('number', 0)
+                                    break
+            
+            print(f"Packing summary:")
+            print(f"- Total parts requested: {total_requested}")
+            print(f"- Total parts packed: {total_parts_packed}")
+            print(f"- Packing rate: {(total_parts_packed/total_requested*100 if total_requested > 0 else 0):.2f}%")
+            
+            # Calculate total stock volume
+            total_stock_volume = 0
+            for block in helper.all_big_blocks:
+                total_stock_volume += block.volume
+            
+            # Calculate efficiency
+            if total_stock_volume > 0:
+                efficiency = (total_prism_volume / total_stock_volume) * 100
+            else:
+                efficiency = 0
+            
+            print(f"- Total stock volume: {total_stock_volume:.2f}")
+            print(f"- Total prism volume: {total_prism_volume:.2f}")
+            print(f"- Efficiency: {efficiency:.2f}%")
+            print(f"- Optimization duration: {optimization_duration:.2f} seconds")
+            
+            # Prepare detailed block information
+            blocks_info = []
+            for block in helper.all_big_blocks:
+                try:
+                    # Count prisms in this block
+                    prism_counts = {}
+                    for entry in block.prism_details:
+                        prism = entry['prism']
+                        count = len(entry['coordinates'])
+                        prism_counts[prism.code] = prism_counts.get(prism.code, 0) + count
+                    
+                    prism_list = [{"code": code, "count": count} for code, count in prism_counts.items()]
+                    
+                    blocks_info.append({
+                        'code': block.unique_code,
+                        'size': [float(dim) for dim in block.size],
+                        'efficiency': float(block.get_efficiency()),
+                        'prisms': prism_list,
+                        'volume': float(block.volume),
+                        'start_coord': [float(coord) for coord in block.start_coord]
+                    })
+                except Exception as e:
+                    print(f"Error processing block {block.unique_code}: {e}")
+                    continue
+            
+            # Prepare scrap information
+            scraps_info = []
+            for scrap in helper.all_scrap:
+                try:
+                    scraps_info.append({
+                        'code': scrap.unique_code,
+                        'size': [float(dim) for dim in scrap.size],
+                        'volume': float(scrap.volume),
+                        'start_coord': [float(coord) for coord in scrap.start_coord],
+                        'parent_block': scrap.parent_block.unique_code if scrap.parent_block else None
+                    })
+                except Exception as e:
+                    print(f"Error processing scrap {scrap.unique_code}: {e}")
+                    continue
+            
+            # Prepare prism summary
+            prism_summary = []
+            for part in parts_data:
+                # Find matching prism in helper
+                packed_count = 0
+                for block_info in blocks_info:
+                    for prism_info in block_info['prisms']:
+                        if prism_info['code'] == part['MARK']:
+                            packed_count += prism_info['count']
+                
+                prism_summary.append({
+                    'code': part['MARK'],
+                    'requested': part['Nos'],
+                    'packed': packed_count,
+                    'remaining': max(0, part['Nos'] - packed_count),
+                    'bottom_length': part['Bottom Length'],
+                    'top_length': part['Top Length'],
+                    'width': part['Width'],
+                    'height': part['Height'],
+                    'volume': 0.5 * (part['Bottom Length'] + part['Top Length']) * part['Width'] * part['Height'],
+                    'packing_rate': (packed_count / part['Nos'] * 100) if part['Nos'] > 0 else 0
+                })
+            
+        except Exception as e:
+            print(f"Error preparing results: {e}")
+            traceback.print_exc()
+            # Create minimal results
+            blocks_info = []
+            scraps_info = []
+            prism_summary = []
+            total_stock_volume = 0
+            total_prism_volume = 0
+            total_parts_packed = 0
+            total_requested = sum(part['Nos'] for part in parts_data)
             efficiency = 0
-        
-        # Prepare detailed block information
-        blocks_info = []
-        for block in helper.all_big_blocks:
-            # Count prisms in this block
-            prism_counts = {}
-            for entry in block.prism_details:
-                prism = entry['prism']
-                count = len(entry['coordinates'])
-                if prism.code not in prism_counts:
-                    prism_counts[prism.code] = 0
-                prism_counts[prism.code] += count
-            
-            prism_list = [{"code": code, "count": count} for code, count in prism_counts.items()]
-            
-            blocks_info.append({
-                'code': block.unique_code,
-                'size': block.size,
-                'efficiency': round(block.get_efficiency(), 2),
-                'prisms': prism_list,
-                'volume': float(block.volume)
-            })
-        
-        # Prepare scrap information
-        scraps_info = []
-        for scrap in helper.all_scrap:
-            scraps_info.append({
-                'code': scrap.unique_code,
-                'size': scrap.size,
-                'volume': float(scrap.volume)
-            })
         
         # ====================
         # 7. SAVE TO HISTORY
         # ====================
+        history_saved = False
+        history_id = None
+        
         try:
             # Check if OptimizationHistory model exists
             from django.apps import apps
-            history_saved = False
-            history_id = None
             
             if apps.is_installed('planner'):
-                try:
-                    from .models import OptimizationHistory
-                    
-                    # Get a meaningful job name
-                    timestamp = timezone.now().strftime("%Y-%m-%d %H:%M")
-                    job_name = f"{excel_file.name.split('.')[0]} - {timestamp}"
-                    
-                    # Save to history
-                    history = OptimizationHistory.objects.create(
-                        user=request.user,
-                        job_name=job_name,
-                        uploaded_file_name=excel_file.name,
-                        uploaded_file_data=parts_data,  # Store the filtered parts data
-                        selected_blocks=selected_blocks,
-                        selected_parents=parent_labels,
-                        parameters={
-                            'buffer_spacing': buffer_spacing,
-                            'parent_blocks_used': parent_block_sizes,
-                            'parent_labels': parent_labels,
-                            'original_part_count': original_part_count,
-                            'filtered_part_count': len(parts_data)
-                        },
-                        optimization_results={
-                            'blocks': blocks_info,
-                            'scraps': scraps_info,
-                            'summary': {
-                                'efficiency': round(efficiency, 2),
-                                'total_parts_packed': total_parts_packed,
-                                'total_parts_requested': total_requested,
-                                'total_blocks_created': len(helper.all_big_blocks),
-                                'total_stock_volume': round(total_stock_volume, 2),
-                                'total_prism_volume': round(total_prism_volume, 2)
-                            }
-                        },
-                        efficiency=round(efficiency, 2),
-                        total_blocks_created=len(helper.all_big_blocks),
-                        total_parts_packed=total_parts_packed,
-                        total_parts_requested=total_requested,
-                        prism_summary=prism_summary
-                    )
-                    
-                    history_id = history.id
-                    history_saved = True
-                    print(f"[HISTORY] Saved optimization #{history.id} for user {request.user.username}")
-                    
-                except ImportError as ie:
-                    print(f"[HISTORY] OptimizationHistory model not found: {ie}")
-                except Exception as history_error:
-                    print(f"[HISTORY] Error saving history (non-critical): {history_error}")
-                    # Don't fail the main request if history saving fails
+                from .models import OptimizationHistory
+                
+                # Create a meaningful job name
+                timestamp = timezone.now().strftime("%Y-%m-%d %H:%M:%S")
+                job_name = f"{os.path.splitext(excel_file.name)[0]} - {timestamp}"
+                
+                # Prepare optimization results
+                optimization_results = {
+                    'blocks': blocks_info,
+                    'scraps': scraps_info,
+                    'summary': {
+                        'efficiency': round(efficiency, 2),
+                        'total_parts_packed': total_parts_packed,
+                        'total_parts_requested': total_requested,
+                        'packing_percentage': round(total_parts_packed / total_requested * 100, 2) if total_requested > 0 else 0,
+                        'total_blocks_created': len(helper.all_big_blocks),
+                        'total_stock_volume': round(total_stock_volume, 2),
+                        'total_prism_volume': round(total_prism_volume, 2),
+                        'waste_percentage': round(100 - efficiency, 2),
+                        'optimization_duration_seconds': round(optimization_duration, 2)
+                    }
+                }
+                
+                # Save to history
+                history = OptimizationHistory.objects.create(
+                    user=request.user,
+                    job_name=job_name,
+                    uploaded_file_name=excel_file.name,
+                    uploaded_file_data=parts_data,
+                    selected_blocks=selected_blocks,
+                    selected_parents=parent_labels,
+                    parameters={
+                        'buffer_spacing': buffer_spacing,
+                        'parent_blocks_used': parent_block_sizes,
+                        'parent_labels': parent_labels,
+                        'max_retries': max_retries,
+                        'retry_enabled': retry_enabled,
+                        'original_part_count': original_part_count,
+                        'filtered_part_count': len(parts_data),
+                        'optimization_duration_seconds': optimization_duration
+                    },
+                    optimization_results=optimization_results,
+                    efficiency=round(efficiency, 2),
+                    total_blocks_created=len(helper.all_big_blocks),
+                    total_parts_packed=total_parts_packed,
+                    total_parts_requested=total_requested,
+                    prism_summary=prism_summary
+                )
+                
+                history_id = history.id
+                history_saved = True
+                print(f"[HISTORY] Saved optimization #{history.id} for user {request.user.username}")
+                
+        except ImportError as ie:
+            print(f"[HISTORY] OptimizationHistory model not found: {ie}")
         except Exception as history_error:
-            print(f"[HISTORY] Unexpected error in history saving: {history_error}")
+            print(f"[HISTORY] Error saving history (non-critical): {history_error}")
+            traceback.print_exc()
+            # Don't fail the main request if history saving fails
         
         # ====================
         # 8. PREPARE FINAL RESPONSE
@@ -764,20 +1024,33 @@ def upload_and_optimize(request):
             'parent_blocks_used': parent_block_sizes,
             'parent_labels': parent_labels,
             'prism_summary': prism_summary,
+            'optimization_parameters': {
+                'buffer_spacing': buffer_spacing,
+                'max_retries': max_retries,
+                'retry_enabled': retry_enabled,
+                'optimization_duration_seconds': round(optimization_duration, 2)
+            },
             'history_saved': history_saved,
             'history_id': history_id,
-            'message': f'Created {len(helper.all_big_blocks)} stock blocks with {efficiency:.2f}% efficiency. '
-                      f'Packed {total_parts_packed} out of {total_requested} parts.',
+            'message': f'Successfully packed {total_parts_packed} out of {total_requested} parts ({total_parts_packed/total_requested*100:.1f}%) into {len(helper.all_big_blocks)} stock blocks with {efficiency:.2f}% efficiency in {optimization_duration:.2f} seconds.',
             'timestamp': timezone.now().isoformat(),
-            'user': request.user.username
+            'user': request.user.username,
+            'file_processed': {
+                'name': excel_file.name,
+                'size_kb': round(excel_file.size / 1024, 2),
+                'rows_processed': len(parts_data)
+            }
         }
         
-        print(f"[RESPONSE] Returning optimization results with {len(blocks_info)} blocks")
+        print(f"\n=== OPTIMIZATION COMPLETED SUCCESSFULLY ===")
+        print(f"Returning results with {len(blocks_info)} blocks")
+        print(f"Total optimization time: {optimization_duration:.2f} seconds")
+        
         return Response(results)
         
     except Exception as e:
-        print(f"ERROR in upload_and_optimize: {str(e)}")
-        import traceback
+        print(f"\n=== OPTIMIZATION FAILED ===")
+        print(f"Error: {str(e)}")
         traceback.print_exc()
         
         # Try to save failed optimization to history
@@ -794,14 +1067,84 @@ def upload_and_optimize(request):
                 total_blocks_created=0,
                 total_parts_packed=0,
                 total_parts_requested=0,
-                error_message=str(e)
+                error_message=str(e),
+                status='failed'
             )
-        except:
-            pass  # Ignore history errors in error handler
+        except Exception as history_err:
+            print(f"[HISTORY] Error saving failed optimization: {history_err}")
         
         return Response({
             'success': False,
-            'error': f"Optimization failed: {str(e)}"
+            'error': f"Optimization failed: {str(e)}",
+            'traceback': traceback.format_exc() if settings.DEBUG else None
+        }, status=500)
+
+
+# ================================
+# NEW ENDPOINT FOR RETRY SETTINGS
+# ================================
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def set_optimization_settings(request):
+    """
+    Set optimization settings for the user
+    
+    POST /api/optimization-settings/
+    
+    Body:
+    {
+        "max_retries": 1000,
+        "default_buffer_spacing": 2.0,
+        "enable_retry": true,
+        "default_parent_blocks": [
+            {"label": "Standard 1", "dimensions": {"length": 2000, "width": 800, "height": 400}},
+            {"label": "Standard 2", "dimensions": {"length": 1870, "width": 800, "height": 350}}
+        ]
+    }
+    """
+    try:
+        data = request.data
+        
+        # Validate input
+        max_retries = data.get('max_retries', 1000)
+        if max_retries < 1 or max_retries > 10000:
+            return Response({
+                'success': False,
+                'error': 'max_retries must be between 1 and 10000'
+            }, status=400)
+        
+        buffer_spacing = data.get('default_buffer_spacing', 2.0)
+        if buffer_spacing < 0 or buffer_spacing > 50:
+            return Response({
+                'success': False,
+                'error': 'buffer_spacing must be between 0 and 50'
+            }, status=400)
+        
+        # Save to user profile or cache
+        from django.core.cache import cache
+        settings_key = f"optimization_settings_{request.user.id}"
+        
+        settings = {
+            'max_retries': max_retries,
+            'default_buffer_spacing': buffer_spacing,
+            'enable_retry': data.get('enable_retry', True),
+            'default_parent_blocks': data.get('default_parent_blocks', []),
+            'updated_at': timezone.now().isoformat()
+        }
+        
+        cache.set(settings_key, settings, timeout=60*60*24*7)  # 1 week
+        
+        return Response({
+            'success': True,
+            'message': 'Optimization settings saved',
+            'settings': settings
+        })
+        
+    except Exception as e:
+        return Response({
+            'success': False,
+            'error': str(e)
         }, status=500)
 
 # ================================

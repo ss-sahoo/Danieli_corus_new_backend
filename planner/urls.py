@@ -10,12 +10,12 @@ from .views import (
     PartSpecificationViewSet,
     CuttingJobViewSet,
     ConfigurationSetViewSet,
-    Top3ConfigurationsView,
+    # Top3ConfigurationsView,
     VisualizationFileView,
     delete_optimization_history,
     get_optimization_history,
     get_optimization_details,
-    rename_optimization,
+    # rename_optimization,
     delete_optimization_history,
     
     # File upload and optimization
@@ -28,10 +28,10 @@ from .views import (
     get_visualization_file,
     
     # Other endpoints
-    api_trapezoidal_packing,
+    # api_trapezoidal_packing,
     upload_optimize_django,
-    debug_excel_data,
-    test_complete_orchestrator,
+    # debug_excel_data,
+    # test_complete_orchestrator,
 )
 
 # Create router for viewsets
@@ -66,19 +66,19 @@ urlpatterns = [
     # ================================
     # OTHER ENDPOINTS
     # ================================
-    path('configurations/top3/', Top3ConfigurationsView.as_view(), name='top3-configurations'),
-    path('trapezoidal-packing/', api_trapezoidal_packing, name='trapezoidal-packing'),
+    # path('configurations/top3/', Top3ConfigurationsView.as_view(), name='top3-configurations'),
+    # path('trapezoidal-packing/', api_trapezoidal_packing, name='trapezoidal-packing'),
     
     # ================================
     # DEBUG & TEST ENDPOINTS
     # ================================
-    path('debug-excel/', debug_excel_data, name='debug-excel'),
-    path('test-complete-orchestrator/', test_complete_orchestrator, name='test-complete-orchestrator'),
+    # path('debug-excel/', debug_excel_data, name='debug-excel'),
+    # path('test-complete-orchestrator/', test_complete_orchestrator, name='test-complete-orchestrator'),
 
     # In planner/urls.py, add these to urlpatterns:
 
     path('optimization-history/', get_optimization_history, name='optimization-history'),
     path('optimization-history/<int:history_id>/', get_optimization_details, name='optimization-details'),
-    path('optimization-history/<int:history_id>/rename/', rename_optimization, name='rename-optimization'),
+    # path('optimization-history/<int:history_id>/rename/', rename_optimization, name='rename-optimization'),
     path('optimization-history/delete/', delete_optimization_history, name='delete-optimization-history'),
     ]
