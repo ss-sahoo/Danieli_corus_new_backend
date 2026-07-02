@@ -432,7 +432,7 @@ def upload_and_optimize(request):
     - selected_blocks: JSON array of selected block IDs (optional)
     - parent_blocks: JSON array of parent block sizes (required)
     - buffer_spacing: float (default: 2.0)
-    - max_retries: int (default: 1000, optional)
+    - max_retries: int (default: 10000, optional)
     - retry_enabled: bool (default: True, optional)
     """
     try:
@@ -465,7 +465,7 @@ def upload_and_optimize(request):
         selected_blocks_json = request.POST.get('selected_blocks', '[]')
         parent_blocks_json = request.POST.get('parent_blocks', '[]')
         buffer_spacing = float(request.POST.get('buffer_spacing', '2.0'))
-        max_retries = int(request.POST.get('max_retries', '1500'))
+        max_retries = int(request.POST.get('max_retries', '5000'))
         retry_enabled = request.POST.get('retry_enabled', 'true').lower() == 'true'
         
         try:
@@ -775,7 +775,7 @@ def upload_and_optimize(request):
             cache.set(
                 "latest_helper",
                 helper,
-                timeout=60 * 60 * 2  # 2 hours
+                timeout=60 * 60 * 24 * 7  # 2 hours
             )
             # print(f"Cached helper for visualizations.")
             
@@ -1094,7 +1094,7 @@ def set_optimization_settings(request):
     
     Body:
     {
-        "max_retries": 1000,
+        "max_retries": 10000,
         "default_buffer_spacing": 2.0,
         "enable_retry": true,
         "default_parent_blocks": [
@@ -1107,7 +1107,7 @@ def set_optimization_settings(request):
         data = request.data
         
         # Validate input
-        max_retries = data.get('max_retries', 1000)
+        max_retries = data.get('max_retries', 10000)
         if max_retries < 1 or max_retries > 10000:
             return Response({
                 'success': False,
@@ -1358,126 +1358,7 @@ def rename_optimization(request, history_id):
             'success': False,
             'error': str(e)
         }, status=500)
-    
 
-
-
-
-
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def test_complete_orchestrator(request):
-    """Test the complete orchestrator system"""
-    try:
-        # Use test data
-        test_parts_data = [{
-            'MARK': 'G14',
-            'Bottom Length': 598.8,
-            'Top Length': 566.3,
-            'Width': 444.5,
-            'Height': 67.8,
-            'Nos': 5
-        }, {
-            'MARK': 'G15',
-            'Bottom Length': 598.8,
-            'Top Length': 581.0,
-            'Width': 242.5,
-            'Height': 93.6,
-            'Nos': 3
-        }]
-        
-        # Get parent blocks from request or use defaults
-        parent_blocks_data = request.data.get('parent_blocks', [
-            {'length': 1870, 'width': 800, 'height': 350},
-            {'length': 2000, 'width': 800, 'height': 400}
-        ])
-        
-        parent_block_sizes = []
-        for block in parent_blocks_data:
-            if isinstance(block, dict) and 'length' in block and 'width' in block and 'height' in block:
-                parent_block_sizes.append([block['length'], block['width'], block['height']])
-        
-        if not parent_block_sizes:
-            parent_block_sizes = [[2000, 500, 500]]
-        
-        print(f"\n=== TESTING ORCHESTRATOR ===")
-        print(f"Parent block sizes: {parent_block_sizes}")
-        
-        from .modules.packing_module import OptimizationEngine
-        
-        engine = OptimizationEngine(
-            stock_dimensions={'length': 2000, 'width': 500, 'height': 500},
-            parts_data=test_parts_data,
-            buffer_spacing=2.0
-        )
-        
-        results = engine.optimize(selected_blocks=None, parent_block_sizes=parent_block_sizes)
-        
-        return Response({
-            'test_success': True,
-            'results': results
-        })
-        
-    except Exception as e:
-        import traceback
-        return Response({
-            'test_success': False,
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }, status=500)
-
-
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def debug_excel_data(request):
-    """
-    Debug endpoint to see Excel file contents
-    """
-    try:
-        if 'file' not in request.FILES:
-            return Response({'success': False, 'error': 'No file uploaded'}, status=400)
-        
-        excel_file = request.FILES['file']
-        
-        # Read the file
-        if excel_file.name.endswith('.csv'):
-            df = pd.read_csv(excel_file)
-        else:
-            df = pd.read_excel(excel_file, engine='openpyxl')
-        
-        # Get basic info
-        file_info = {
-            'filename': excel_file.name,
-            'size': excel_file.size,
-            'rows': len(df),
-            'columns': len(df.columns),
-            'column_names': df.columns.tolist(),
-            'first_5_rows': df.head().to_dict('records'),
-            'dtypes': {col: str(df[col].dtype) for col in df.columns}
-        }
-        
-        # Check for required columns
-        required_columns = ['MARK', 'Bottom Length', 'Top Length', 'Width', 'Height', 'Nos']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        
-        # Check data types
-        numeric_issues = []
-        for col in ['Bottom Length', 'Top Length', 'Width', 'Height', 'Nos']:
-            if col in df.columns:
-                non_numeric = df[col].apply(lambda x: not (isinstance(x, (int, float)) or (isinstance(x, str) and x.replace('.', '', 1).isdigit())))
-                if non_numeric.any():
-                    numeric_issues.append(f"{col}: {non_numeric.sum()} non-numeric values")
-        
-        return Response({
-            'success': True,
-            'file_info': file_info,
-            'missing_columns': missing_columns,
-            'numeric_issues': numeric_issues,
-            'sample_data': df.head(10).to_dict('records')
-        })
-        
-    except Exception as e:
-        return Response({'success': False, 'error': str(e)}, status=500)
 
 
 # ================================
@@ -1641,82 +1522,6 @@ class ConfigurationSetViewSet(viewsets.ReadOnlyModelViewSet):
 # OTHER EXISTING ENDPOINTS
 # ================================
 
-class Top3ConfigurationsView(APIView):
-    """
-    API endpoint to compute and return top 3 packing configurations.
-    """
-    def post(self, request):
-        input_serializer = Top3ConfigurationsRequestSerializer(data=request.data)
-        input_serializer.is_valid(raise_exception=True)
-
-        config_set = ConfigurationSet.objects.create(
-            stock_dimensions=input_serializer.validated_data['stock_dimensions'],
-            parts_spec=input_serializer.validated_data['parts'],
-            config_params=input_serializer.validated_data.get('config_params', {}),
-            status='running'
-        )
-
-        try:
-            top_n = input_serializer.validated_data.get('top_n', 3)
-            
-            # Import the API wrapper
-            try:
-                from pack_manually_api import compute_top3_approaches
-            except ImportError:
-                return Response({
-                    'success': False,
-                    'error': 'pack_manually_api module not found'
-                }, status=500)
-
-            result = compute_top3_approaches(
-                stock_dimensions=config_set.stock_dimensions,
-                parts=config_set.parts_spec,
-                config_params=config_set.config_params,
-                top_n=top_n
-            )
-
-            # Save configurations to database
-            for config_data in result['top_approaches']:
-                Configuration.objects.create(
-                    configuration_set=config_set,
-                    primary_part_name=config_data['primary_part'],
-                    merging_plane_order=config_data['merging_plane_order'],
-                    stock_dimensions=config_set.stock_dimensions,
-                    parts_spec=config_set.parts_spec,
-                    config_params=config_set.config_params,
-                    total_parts=config_data['total_parts'],
-                    total_volume_used=result[f"Approach_{config_data['rank']}"].get('total_volume_used', 0),
-                    waste_percentage=config_data['waste'],
-                    is_extractable=True,
-                    parts_breakdown=config_data['parts_breakdown'],
-                    visualization_file=config_data['visualization_file'],
-                )
-
-            config_set.status = 'completed'
-            config_set.completed_at = timezone.now()
-            config_set.save()
-
-            return Response({
-                'configuration_set_id': config_set.id,
-                'configurations': result['top_approaches']
-            }, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            config_set.status = 'failed'
-            config_set.error_message = str(e)
-            config_set.completed_at = timezone.now()
-            config_set.save()
-
-            import traceback
-            return Response(
-                {
-                    'error': str(e),
-                    'traceback': traceback.format_exc(),
-                    'configuration_set_id': config_set.id
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-
 
 class VisualizationFileView(APIView):
     """
@@ -1739,52 +1544,6 @@ class VisualizationFileView(APIView):
             return FileResponse(open(full_path, 'rb'), content_type='text/html')
         except Exception as e:
             raise Http404(f"Error serving file: {e}")
-
-
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def api_trapezoidal_packing(request):
-    """
-    API endpoint for trapezoidal packing (JSON input)
-    """
-    try:
-        data = request.data
-        
-        stock_dimensions = data.get('stock_dimensions', {
-            'length': 2000,
-            'width': 500,
-            'height': 500
-        })
-        
-        parts = data.get('parts', [])
-        config_params = data.get('config_params', {})
-        top_n = data.get('top_n', 3)
-        
-        if new_pack_trapezoidal_prisms is None:
-            return Response(
-                {'success': False, 'error': 'Trapezoidal packing module not available'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-        
-        results = new_pack_trapezoidal_prisms(
-            stock_dimensions=stock_dimensions,
-            parts=parts,
-            config_params=config_params,
-            top_n=top_n
-        )
-        
-        return Response(results, status=status.HTTP_200_OK)
-        
-    except Exception as e:
-        print(f"[Trapezoidal Packing] Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
-        return Response(
-            {'success': False, 'error': str(e)},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
 
 @csrf_exempt
 @require_POST
