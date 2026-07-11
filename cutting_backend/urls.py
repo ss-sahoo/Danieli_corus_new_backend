@@ -3,7 +3,7 @@ URL configuration for cutting_backend project.
 """
 from django.conf import settings
 from django.conf.urls.static import static
-from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.views import TokenRefreshView
 from django.contrib import admin
 from django.urls import path, include
 from drf_spectacular.views import (
@@ -11,12 +11,41 @@ from drf_spectacular.views import (
     SpectacularSwaggerView,
     SpectacularRedocView,
 )
+from planner.user_views import (
+    custom_login,
+    current_user_info,
+    list_users,
+    create_user,
+    update_user,
+    delete_user,
+    toggle_executed,
+)
+from planner.inventory_views import (
+    list_inventory,
+    add_to_inventory,
+    remove_from_inventory,
+)
 
 urlpatterns = [
     # Admin
     path('admin/', admin.site.urls),
-    path("auth/login/", TokenObtainPairView.as_view(), name="jwt_login"),
+
+    # Auth
+    path("auth/login/", custom_login, name="jwt_login"),
     path("auth/refresh/", TokenRefreshView.as_view(), name="jwt_refresh"),
+    path("auth/me/", current_user_info, name="current_user"),
+
+    # User management (superadmin only)
+    path("api/users/", list_users, name="list_users"),
+    path("api/users/create/", create_user, name="create_user"),
+    path("api/users/<int:user_id>/update/", update_user, name="update_user"),
+    path("api/users/<int:user_id>/delete/", delete_user, name="delete_user"),
+    path("api/optimization-history/<int:history_id>/toggle-executed/", toggle_executed, name="toggle_executed"),
+
+    # Scrap Inventory (shared across all users)
+    path("api/inventory/", list_inventory, name="list_inventory"),
+    path("api/inventory/add/", add_to_inventory, name="add_to_inventory"),
+    path("api/inventory/<int:scrap_pk>/remove/", remove_from_inventory, name="remove_from_inventory"),
 
     # API endpoints
     path('api/', include('planner.urls')),

@@ -995,9 +995,24 @@ def upload_and_optimize(request):
                     prism_summary=prism_summary
                 )
                 
+                # Build a professional, industry-style job name:
+                # e.g. "OPT-0007 · SteelParts Jul11" instead of "Run #7 - sample_data"
+                raw_stem = os.path.splitext(excel_file.name)[0]          # e.g. "sample_data"
+                clean_stem = raw_stem.replace('_', ' ').replace('-', ' ').strip().title()  # "Sample Data"
+                date_tag = timezone.now().strftime("%d %b %y")            # "11 Jul 26"
+                history.job_name = f"OPT-{history.id:04d} \u00b7 {clean_stem} \u00b7 {date_tag}"
+                history.save(update_fields=['job_name'])
+                
                 history_id = history.id
                 history_saved = True
                 print(f"[HISTORY] Saved optimization #{history.id} for user {request.user.username}")
+
+                # Auto-save scraps to inventory
+                try:
+                    from .inventory_views import auto_save_scraps_from_optimization
+                    auto_save_scraps_from_optimization(helper, history, request.user)
+                except Exception as inv_err:
+                    print(f"[INVENTORY] Error saving scraps (non-critical): {inv_err}")
                 
         except ImportError as ie:
             print(f"[HISTORY] OptimizationHistory model not found: {ie}")
@@ -1158,38 +1173,48 @@ def set_optimization_settings(request):
 @permission_classes([IsAuthenticated])
 def get_optimization_history(request):
     """
-    Get optimization history for the current user
-    
     GET /api/optimization-history/
-    Returns list of all optimizations with summary
+    - Normal users: see only their own history
+    - Superadmin/staff: see all users' history (pass all_users=true)
+    - Search: ?search=<id or job name>
     """
     try:
         from .models import OptimizationHistory
-        
-        # Get pagination parameters
-        page = int(request.GET.get('page', 1))
-        page_size = int(request.GET.get('page_size', 10))
-        
-        # Query history for current user
-        history = OptimizationHistory.objects.filter(user=request.user)
-        
-        # Get total count
+        from django.db.models import Q
+
+        page = max(1, int(request.GET.get('page', 1)))
+        page_size = min(100, max(1, int(request.GET.get('page_size', 50))))
+        search = request.GET.get('search', '').strip()
+        show_all = request.GET.get('all_users', 'false').lower() == 'true'
+
+        # Superadmin/staff can see everyone's history
+        if show_all and (request.user.is_superuser or request.user.is_staff):
+            history = OptimizationHistory.objects.select_related('user').all()
+        else:
+            history = OptimizationHistory.objects.filter(user=request.user)
+
+        # Search by numeric ID or job name
+        if search:
+            clean_search = search.lstrip('#').strip()
+            if clean_search.isdigit():
+                history = history.filter(
+                    Q(id=clean_search) | Q(job_name__icontains=search)
+                )
+            else:
+                history = history.filter(job_name__icontains=search)
+
         total_count = history.count()
-        
-        # Paginate
         start = (page - 1) * page_size
         end = start + page_size
         paginated_history = history[start:end]
-        
-        # Prepare response - return summary property
+
         history_list = []
         for item in paginated_history:
-            # Use the summary property you defined in the model
             summary = item.summary
-            # Add any additional fields if needed
             summary['id'] = item.id
+            summary['username'] = item.user.username if hasattr(item, 'user') else None
             history_list.append(summary)
-        
+
         return Response({
             'success': True,
             'data': history_list,
@@ -1197,22 +1222,16 @@ def get_optimization_history(request):
                 'page': page,
                 'page_size': page_size,
                 'total': total_count,
-                'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
+                'total_pages': max(1, (total_count + page_size - 1) // page_size),
                 'has_next': end < total_count,
-                'has_previous': page > 1
+                'has_previous': page > 1,
             }
         })
-        
+
     except Exception as e:
-        print(f"[HISTORY] Error fetching history: {e}")
         import traceback
         traceback.print_exc()
-        
-        return Response({
-            'success': False,
-            'error': str(e),
-            'data': []  # Always return empty array on error
-        }, status=500)
+        return Response({'success': False, 'error': str(e), 'data': []}, status=500)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -1227,7 +1246,10 @@ def get_optimization_details(request, history_id):
         from .models import OptimizationHistory
         
         # Get the history item
-        history = OptimizationHistory.objects.get(id=history_id, user=request.user)
+        if request.user.is_superuser or request.user.is_staff:
+            history = OptimizationHistory.objects.get(id=history_id)
+        else:
+            history = OptimizationHistory.objects.get(id=history_id, user=request.user)
         
         return Response({
             'success': True,

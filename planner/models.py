@@ -41,6 +41,9 @@ class OptimizationHistory(models.Model):
     # Visualization references
     block_visualization_urls = models.JSONField(default=list, blank=True)
     scrap_visualization_urls = models.JSONField(default=list, blank=True)
+
+    # Execution status - can be toggled by user
+    is_executed = models.BooleanField(default=False, help_text="Whether this optimization has been executed/applied")
     
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
@@ -70,7 +73,8 @@ class OptimizationHistory(models.Model):
             'blocks_created': self.total_blocks_created,
             'parts_packed': f"{self.total_parts_packed}/{self.total_parts_requested}",
             'created_at': self.created_at,
-            'file_name': self.uploaded_file_name
+            'file_name': self.uploaded_file_name,
+            'is_executed': self.is_executed,
         }
 class StockBlock(models.Model):
     """
@@ -322,3 +326,68 @@ Configuration.add_to_class(
         related_name='configurations'
     )
 )
+
+
+class ScrapInventory(models.Model):
+    """
+    Global shared scrap inventory.
+    Scraps from optimization results with any dimension > 15mm are auto-added.
+    Smaller scraps can be manually added by users.
+    Shared across all users.
+    """
+    USABILITY_CHOICES = [
+        ('usable', 'Usable'),
+        ('unusable', 'Unusable'),
+        ('manual', 'Manually Added'),
+    ]
+
+    # Scrap identity — derived from parent block e.g. "B1-S3"
+    scrap_id = models.CharField(max_length=100, unique=True)
+    parent_block_code = models.CharField(max_length=100, help_text="e.g. B1")
+
+    # Source optimization
+    optimization_history = models.ForeignKey(
+        OptimizationHistory,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='scraps'
+    )
+    added_by = models.ForeignKey(
+        'auth.User', null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='added_scraps'
+    )
+
+    # Dimensions in mm
+    length = models.FloatField()
+    width = models.FloatField()
+    height = models.FloatField()
+    volume = models.FloatField()
+
+    # Status
+    usability = models.CharField(max_length=20, choices=USABILITY_CHOICES, default='usable')
+    is_in_inventory = models.BooleanField(default=True)
+    notes = models.TextField(blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'scrap_inventory'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['usability']),
+            models.Index(fields=['parent_block_code']),
+            models.Index(fields=['is_in_inventory']),
+        ]
+
+    def __str__(self):
+        return f"{self.scrap_id} ({self.length}×{self.width}×{self.height}mm) [{self.usability}]"
+
+    @property
+    def min_dimension(self):
+        return min(self.length, self.width, self.height)
+
+    @property
+    def dimensions_str(self):
+        return f"{self.length:.0f}×{self.width:.0f}×{self.height:.0f}"
