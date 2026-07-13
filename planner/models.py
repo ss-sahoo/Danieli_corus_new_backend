@@ -44,6 +44,10 @@ class OptimizationHistory(models.Model):
 
     # Execution status - can be toggled by user
     is_executed = models.BooleanField(default=False, help_text="Whether this optimization has been executed/applied")
+
+    # User-defined label
+    label = models.CharField(max_length=100, blank=True, default='', help_text="Custom label for this optimization")
+    label_color = models.CharField(max_length=20, blank=True, default='green', help_text="Label color")
     
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
@@ -75,6 +79,8 @@ class OptimizationHistory(models.Model):
             'created_at': self.created_at,
             'file_name': self.uploaded_file_name,
             'is_executed': self.is_executed,
+            'label': self.label,
+            'label_color': self.label_color,
         }
 class StockBlock(models.Model):
     """

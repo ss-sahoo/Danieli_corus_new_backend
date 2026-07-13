@@ -19,6 +19,7 @@ from planner.user_views import (
     update_user,
     delete_user,
     toggle_executed,
+    set_label,
 )
 from planner.inventory_views import (
     list_inventory,
@@ -28,7 +29,7 @@ from planner.inventory_views import (
 
 urlpatterns = [
     # Admin
-    path('admin/', admin.site.urls),
+    path('secure-admin/', admin.site.urls),
 
     # Auth
     path("auth/login/", custom_login, name="jwt_login"),
@@ -41,6 +42,7 @@ urlpatterns = [
     path("api/users/<int:user_id>/update/", update_user, name="update_user"),
     path("api/users/<int:user_id>/delete/", delete_user, name="delete_user"),
     path("api/optimization-history/<int:history_id>/toggle-executed/", toggle_executed, name="toggle_executed"),
+    path("api/optimization-history/<int:history_id>/label/", set_label, name="set_label"),
 
     # Scrap Inventory (shared across all users)
     path("api/inventory/", list_inventory, name="list_inventory"),

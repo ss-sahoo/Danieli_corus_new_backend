@@ -242,29 +242,78 @@ def _serialize_user(user):
 def toggle_executed(request, history_id):
     """
     PATCH /api/optimization-history/<id>/toggle-executed/
-    Toggle or explicitly set the is_executed flag.
-    Body (optional): { "is_executed": true }
+    Mark the optimization as executed (cannot be reverted).
     """
     try:
         from planner.models import OptimizationHistory
-        # Superadmin or staff can toggle execution status of any user's logic
+        # Superadmin or staff can change execution status of any user's logic
         if request.user.is_superuser or request.user.is_staff:
             history = OptimizationHistory.objects.get(id=history_id)
         else:
             history = OptimizationHistory.objects.get(id=history_id, user=request.user)
 
-        # If explicit value provided use it, otherwise toggle
-        if 'is_executed' in request.data:
-            history.is_executed = bool(request.data['is_executed'])
-        else:
-            history.is_executed = not history.is_executed
+        if history.is_executed:
+            return Response({
+                'success': False,
+                'detail': 'This optimization has already been executed and cannot be reverted.'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
+        history.is_executed = True
         history.save(update_fields=['is_executed'])
+
+        # Mark existing scraps of this optimization as in-inventory on execution
+        try:
+            from .inventory_views import mark_scraps_as_executed
+            mark_scraps_as_executed(history)
+        except Exception as inv_err:
+            print(f"[INVENTORY] Error marking scraps as executed (non-critical): {inv_err}")
 
         return Response({
             'success': True,
             'is_executed': history.is_executed,
-            'message': f"Marked as {'executed' if history.is_executed else 'not executed'}."
+            'message': 'Marked as executed and scraps added to inventory.'
+        })
+    except OptimizationHistory.DoesNotExist:
+        return Response({'detail': 'Not found.'}, status=404)
+    except Exception as e:
+        return Response({'detail': str(e)}, status=500)
+
+
+# ================================
+# SET OPTIMIZATION LABEL
+# ================================
+
+VALID_LABEL_COLORS = {'green', 'red', 'yellow', 'blue', 'purple', 'orange'}
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def set_label(request, history_id):
+    """
+    PATCH /api/optimization-history/<id>/label/
+    Set or clear a custom label for an optimization.
+    Body: {"label": "Today's work", "label_color": "green"}
+          {"label": ""}  — clears the label
+    """
+    try:
+        from planner.models import OptimizationHistory
+        if request.user.is_superuser or request.user.is_staff:
+            history = OptimizationHistory.objects.get(id=history_id)
+        else:
+            history = OptimizationHistory.objects.get(id=history_id, user=request.user)
+
+        label = request.data.get('label', '').strip()[:100]
+        color = request.data.get('label_color', 'green').strip()
+        if color not in VALID_LABEL_COLORS:
+            color = 'green'
+
+        history.label = label
+        history.label_color = color
+        history.save(update_fields=['label', 'label_color'])
+
+        return Response({
+            'success': True,
+            'label': history.label,
+            'label_color': history.label_color,
         })
     except OptimizationHistory.DoesNotExist:
         return Response({'detail': 'Not found.'}, status=404)

@@ -43,8 +43,12 @@ def list_inventory(request):
                   search=<scrap_id or parent_block_code>, page=1, page_size=20
     """
     from .models import ScrapInventory
+    from django.db.models import Q
 
-    qs = ScrapInventory.objects.all()
+    # Only show scraps that are manually added (no optimization_history) or whose parent optimization is executed.
+    qs = ScrapInventory.objects.filter(
+        Q(optimization_history__isnull=True) | Q(optimization_history__is_executed=True)
+    )
 
     usability = request.GET.get('usability', 'usable')
     if usability != 'all':
@@ -122,37 +126,33 @@ def add_to_inventory(request):
     if not scrap_id or not parent_block_code:
         return Response({'detail': 'scrap_id and parent_block_code are required.'}, status=400)
 
+    if ScrapInventory.objects.filter(scrap_id__iexact=scrap_id).exists():
+        return Response({'detail': f'Scrap with ID "{scrap_id}" already exists. Please choose a unique Scrap ID.'}, status=400)
+
     volume = length * width * height
     min_dim = min(length, width, height)
     usability = 'unusable' if min_dim <= MIN_USABLE_MM else 'manual'
 
     try:
-        scrap, created = ScrapInventory.objects.get_or_create(
+        scrap = ScrapInventory.objects.create(
             scrap_id=scrap_id,
-            defaults={
-                'parent_block_code': parent_block_code,
-                'length': length,
-                'width': width,
-                'height': height,
-                'volume': volume,
-                'usability': usability,
-                'is_in_inventory': True,
-                'notes': str(data.get('notes', '')),
-                'added_by': request.user,
-            }
+            parent_block_code=parent_block_code,
+            length=length,
+            width=width,
+            height=height,
+            volume=volume,
+            usability=usability,
+            is_in_inventory=True,
+            notes=str(data.get('notes', '')),
+            added_by=request.user,
         )
-        if not created:
-            # Already exists — ensure it's marked in inventory
-            scrap.is_in_inventory = True
-            scrap.notes = str(data.get('notes', scrap.notes))
-            scrap.save(update_fields=['is_in_inventory', 'notes'])
 
         return Response({
             'success': True,
-            'created': created,
+            'created': True,
             'scrap': _serialize_scrap(scrap),
-            'message': f"Scrap {scrap_id} {'added to' if created else 'updated in'} inventory."
-        }, status=201 if created else 200)
+            'message': f"Scrap {scrap_id} added to inventory."
+        }, status=201)
 
     except Exception as e:
         return Response({'detail': str(e)}, status=500)
@@ -231,7 +231,7 @@ def auto_save_scraps_from_optimization(helper, optimization_history, added_by):
                 height=height,
                 volume=volume,
                 usability=usability,
-                is_in_inventory=is_usable,  # only usable ones auto-added
+                is_in_inventory=False,  # initially False, set to True only when executed
             )
             saved.append(scrap_id)
 
@@ -241,3 +241,19 @@ def auto_save_scraps_from_optimization(helper, optimization_history, added_by):
 
     print(f"[Inventory] Saved {len(saved)} scraps. Usable auto-added to inventory.")
     return saved
+
+
+def mark_scraps_as_executed(optimization_history):
+    """
+    Called when an optimization is marked as executed.
+    Flips is_in_inventory to True for all its associated usable scraps.
+    """
+    from .models import ScrapInventory
+
+    updated = ScrapInventory.objects.filter(
+        optimization_history=optimization_history,
+        usability='usable'
+    ).update(is_in_inventory=True)
+
+    print(f"[Inventory] Marked {updated} usable scraps in inventory for executed optimization #{optimization_history.id}")
+    return updated

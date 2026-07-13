@@ -1007,13 +1007,13 @@ def upload_and_optimize(request):
                 history_saved = True
                 print(f"[HISTORY] Saved optimization #{history.id} for user {request.user.username}")
 
-                # Auto-save scraps to inventory
+                # Auto-save scraps to database (initially not in inventory)
                 try:
                     from .inventory_views import auto_save_scraps_from_optimization
                     auto_save_scraps_from_optimization(helper, history, request.user)
                 except Exception as inv_err:
                     print(f"[INVENTORY] Error saving scraps (non-critical): {inv_err}")
-                
+
         except ImportError as ie:
             print(f"[HISTORY] OptimizationHistory model not found: {ie}")
         except Exception as history_error:
@@ -1264,6 +1264,10 @@ def get_optimization_details(request, history_id):
                 'selected_parents': history.selected_parents,
                 'parameters': history.parameters,
                 'optimization_results': history.optimization_results,
+                'is_executed': history.is_executed,
+                'label': history.label,
+                'label_color': history.label_color,
+                'username': history.user.username,
                 'summary': {
                     'total_blocks_created': history.total_blocks_created,
                     'total_parts_packed': history.total_parts_packed,
