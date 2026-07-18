@@ -502,15 +502,28 @@ class People_helper:
         if len(axis_order_max) != 0:
             rot = Rotation(axis_order=axis_order_max, pivot=scrap.start_coord)
             new_starting_point, size = rot.get_starting_co_and_size(scrap.box_coordinate)
-            
+
+            # Pack in an origin-anchored frame: the edge/scrap extraction in
+            # fill.py/edges.py hardcodes 0 as the frame anchor, so packing at
+            # new_starting_point (which can be negative after rotation, e.g.
+            # rotating a block about [0,0,0]) produces an inconsistent edge set
+            # and get_type() raises. Fill at [0,0,0], then translate the
+            # results to the rotated frame's true position before rotating back.
             co_ordinates_list, big_block_coordinate, end_coordinates, prism_count = fill_the_box(
                 prism,
                 Block_size=size_max,
-                starting_co=new_starting_point,
+                starting_co=[0, 0, 0],
                 buffer=self.buffer
             )
-            scrap_volumes, scrap_Boxes_new = get_scrap_vol(end_coordinates, size_max, new_starting_point)
-            
+            scrap_volumes, scrap_Boxes_new = get_scrap_vol(end_coordinates, size_max, [0, 0, 0], co_ordinates_list)
+
+            # Translate from origin frame to the rotated frame's position
+            offset = np.array(new_starting_point, dtype=float)
+            if co_ordinates_list:
+                co_ordinates_list = (np.array(co_ordinates_list, dtype=float) + offset).tolist()
+            big_block_coordinate = (np.array(big_block_coordinate, dtype=float) + offset).tolist()
+            scrap_volumes = [(np.array(v, dtype=float) + offset).tolist() for v in scrap_volumes]
+
             # Rotate back
             co_ordinates_list = rot.rotate_in_reverse_order(co_ordinates_list).tolist()
             big_block_coordinate = rot.rotate_in_reverse_order(big_block_coordinate)
@@ -686,7 +699,12 @@ def run_final_code(all_prisms: List[Prisms], buffer: float = 2,
             result = helper.fill_the_prism_optimally(prism, b)
             
             if result[0] is None:
-                # Packing failed - break to avoid infinite loop
+                # Packing failed - discard the empty block just created so it
+                # doesn't inflate block count / deflate reported efficiency,
+                # and break to avoid an infinite loop. The prism stays in the
+                # summary as "remaining" (could not be packed).
+                helper.all_big_blocks.remove(b)
+                helper.big_block_count -= 1
                 print(f"Warning: Could not pack remaining {prism.prism_left} units of {prism.code}")
                 break
             
@@ -743,34 +761,49 @@ def run_optimization_with_retries(excel_path: str, parent_block_sizes: List[List
         parent_block_sizes = [[1870, 800, 350], [2000, 800, 400]]
     
     tried = 0
-    
+    last_error = None
+    same_error_count = 0
+
     while tried <= max_tries:
         try:
             # Load prisms
             all_prisms = get_all_prisms(excel_path)
-            
+
             # Sort by volume (largest first)
             prism_list_sorted = sorted(all_prisms, key=lambda p: p.get_volume(), reverse=True)
-            
+
             # Run packing
             helper = run_final_code(prism_list_sorted, buffer=buffer, parent_block_sizes=parent_block_sizes)
-            
+
             # Get results
             block_details = get_block_details(helper)
-            
+
             if block_details is not None and helper is not None:
                 # Check if any block has >= 99% efficiency (too good to be true)
                 has_perfect_block = any(obj['eff'] >= 99 for obj in block_details['blocks'])
-                
+
                 if not has_perfect_block:
                     return helper, block_details
-            
+
             tried += 1
-            
+
         except Exception as e:
             print(f"Attempt {tried} failed: {str(e)}")
             tried += 1
-            
+
+            # Bail out early on repeated identical failures: retrying a
+            # deterministic error max_tries times hangs the request until the
+            # server/proxy timeout kills it, so the client gets an opaque
+            # HTML 500 instead of this error message as JSON.
+            if str(e) == last_error:
+                same_error_count += 1
+                if same_error_count >= 5:
+                    print('Aborting retries: same error 5 times in a row')
+                    raise
+            else:
+                last_error = str(e)
+                same_error_count = 1
+
             if tried == max_tries:
                 print('Max tries exceeded')
                 raise
