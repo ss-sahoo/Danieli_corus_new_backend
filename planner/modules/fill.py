@@ -199,6 +199,27 @@ def draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edge
             opacity=opacity,
             flatshading=True
         )
+
+    def prism_edges(vertices, color='black', width=3):
+        """Return a Scatter3d trace drawing all 12 edges of a box/prism."""
+        # 12 edges of a rectangular prism (pairs of vertex indices)
+        edges = [
+            (0,1),(1,2),(2,3),(3,0),  # bottom face
+            (4,5),(5,6),(6,7),(7,4),  # top face
+            (0,4),(1,5),(2,6),(3,7),  # vertical edges
+        ]
+        ex, ey, ez = [], [], []
+        for a, b in edges:
+            ex += [vertices[a,0], vertices[b,0], None]
+            ey += [vertices[a,1], vertices[b,1], None]
+            ez += [vertices[a,2], vertices[b,2], None]
+        return go.Scatter3d(
+            x=ex, y=ey, z=ez,
+            mode='lines',
+            line=dict(color=color, width=width),
+            showlegend=False,
+            hoverinfo='skip',
+        )
     def draw_line(p1, p2, color="black", width=6):
         return go.Scatter3d(
             x=[p1[0], p2[0]],
@@ -298,8 +319,9 @@ def draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edge
     
     fig = go.Figure()
     
-    # Draw big block (transparent)
-    fig.add_trace(prism_mesh(big_block, color='lightgray', opacity=0.15))
+    # Draw big block (transparent with visible border)
+    fig.add_trace(prism_mesh(big_block, color='lightgray', opacity=0.08))
+    fig.add_trace(prism_edges(big_block, color='#555555', width=4))
 
     # Draw prisms with different colors
     colors = ["red", "green", "blue", "orange", "purple", "cyan"]
@@ -307,7 +329,9 @@ def draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edge
     
     for i, scrap_coordinate in enumerate(scrap_volumes):
         color = colors[i % len(colors)]
-        fig.add_trace(prism_mesh(np.array(scrap_coordinate), color=color, opacity=0.15))
+        sv = np.array(scrap_coordinate)
+        fig.add_trace(prism_mesh(sv, color=color, opacity=0.15))
+        fig.add_trace(prism_edges(sv, color='rgba(0,0,0,0.4)', width=2))
 
     '''i =0
     for scrap_coordinate in scrap_volumes:
@@ -320,6 +344,7 @@ def draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edge
     for idx, p in enumerate(prisms):
         color = colors[idx % len(colors)]
         fig.add_trace(prism_mesh(p, color=color, opacity=0.9))
+        fig.add_trace(prism_edges(p, color='black', width=2))
 
         # Draw x_edges lines
     for edge in x_edges:
@@ -361,10 +386,21 @@ def draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edge
             xaxis_title="X",
             yaxis_title="Y",
             zaxis_title="Z",
-            aspectmode='data'
+            aspectmode='data',
+            camera=dict(
+                eye=dict(x=1.5, y=-1.8, z=1.2),
+                up=dict(x=0, y=0, z=1),
+            ),
+            xaxis=dict(showgrid=True, gridcolor='rgba(200,200,200,0.5)', zeroline=False),
+            yaxis=dict(showgrid=True, gridcolor='rgba(200,200,200,0.5)', zeroline=False),
+            zaxis=dict(showgrid=True, gridcolor='rgba(200,200,200,0.5)', zeroline=False),
         ),
+        scene_dragmode='orbit',
+        margin=dict(l=0, r=0, t=40, b=0),
         width=900,
-        height=700
+        height=700,
+        paper_bgcolor='white',
+        plot_bgcolor='white',
     )
 
     

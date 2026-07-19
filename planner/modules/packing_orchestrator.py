@@ -181,11 +181,11 @@ class Block:
             planes={"xy_planes": [], "zx_planes": [], "yz_planes": []},
             scrap_volumes=scrap_volumes if only_scrap else []
         )
-    
-        if save_path:
-            with open(save_path, "w") as f:
-                f.write(fig.to_html(full_html=True))
-    
+        
+        if save_path and fig:
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(fig.to_html(full_html=True, include_plotlyjs='cdn'))
+                
         return fig
 
 
@@ -205,7 +205,7 @@ class Scrap(Block):
     def draw_scrap(self, save_path=None):
         if not self.parent_block:
             raise RuntimeError("Scrap has no parent block")
-
+            
         fig = draw(
             self.parent_block.box_coordinate,
             co_ordinates_list=[],
@@ -215,21 +215,33 @@ class Scrap(Block):
             planes={"xy_planes": [], "zx_planes": [], "yz_planes": []},
             scrap_volumes=[self.box_coordinate]
         )
-
+        
         if fig is None:
             raise RuntimeError("draw() returned None for scrap visualization")
-
+            
         fig.update_layout(
             title=f"3D Scrap Visualization ({self.unique_code})",
-            scene=dict(aspectmode="data"),
+            scene=dict(
+                aspectmode="data",
+                camera=dict(
+                    eye=dict(x=1.5, y=-1.8, z=1.2),
+                    up=dict(x=0, y=0, z=1),
+                ),
+                xaxis=dict(showgrid=True, gridcolor='rgba(200,200,200,0.5)', zeroline=False),
+                yaxis=dict(showgrid=True, gridcolor='rgba(200,200,200,0.5)', zeroline=False),
+                zaxis=dict(showgrid=True, gridcolor='rgba(200,200,200,0.5)', zeroline=False),
+            ),
+            scene_dragmode='orbit',
+            margin=dict(l=0, r=0, t=40, b=0),
             width=900,
-            height=700
+            height=700,
+            paper_bgcolor='white',
         )
-
+        
         if save_path:
-            with open(save_path, "w") as f:
-                f.write(fig.to_html(full_html=True))
-
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(fig.to_html(full_html=True, include_plotlyjs='cdn'))
+                
         return fig
 
 

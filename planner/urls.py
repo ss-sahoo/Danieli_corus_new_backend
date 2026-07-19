@@ -15,6 +15,7 @@ from .views import (
     delete_optimization_history,
     get_optimization_history,
     get_optimization_details,
+    toggle_executed,
     # rename_optimization,
     delete_optimization_history,
     
@@ -26,6 +27,10 @@ from .views import (
     generate_block_visualization,
     generate_scrap_visualization,
     get_visualization_file,
+    download_block_visualization,
+    download_block_images,
+    download_all_blocks_zip,
+    view_all_blocks,
     
     # Other endpoints
     # api_trapezoidal_packing,
@@ -59,6 +64,10 @@ urlpatterns = [
     # 3D VISUALIZATION ENDPOINTS
     # ================================
     path('visualization/block/<str:block_code>/', generate_block_visualization, name='generate-block-visualization'),
+    path('visualization/block/<str:block_code>/download/', download_block_visualization, name='download-block-visualization'),
+    path('visualization/block/<str:block_code>/images/', download_block_images, name='download-block-images'),
+    path('visualization/blocks/download-all/', download_all_blocks_zip, name='download-all-blocks-zip'),
+    path('visualization/blocks/view-all/', view_all_blocks, name='view-all-blocks'),
     path('visualization/scrap/<str:scrap_code>/', generate_scrap_visualization, name='generate-scrap-visualization'),
     path('visualization/file/<str:filename>/', get_visualization_file, name='get-visualization-file'),
     path('visualizations/<path:filepath>/', VisualizationFileView.as_view(), name='visualization-file'),
@@ -79,6 +88,7 @@ urlpatterns = [
 
     path('optimization-history/', get_optimization_history, name='optimization-history'),
     path('optimization-history/<int:history_id>/', get_optimization_details, name='optimization-details'),
+    path('optimization-history/<int:history_id>/toggle-executed/', toggle_executed, name='toggle-executed'),
     # path('optimization-history/<int:history_id>/rename/', rename_optimization, name='rename-optimization'),
     path('optimization-history/delete/', delete_optimization_history, name='delete-optimization-history'),
     ]

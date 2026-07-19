@@ -13,7 +13,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from django.utils import timezone
 from django.http import FileResponse, Http404, JsonResponse
 from django.shortcuts import get_object_or_404
@@ -27,6 +27,289 @@ import time
 
 # Add the project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def generate_block_6_side_images(block, output_dir, block_code):
+    """
+    Generate a single HTML file with 6-side views of a block using SVGs.
+    """
+    try:
+        from .modules.svg_renderer import get_block_svg_html
+        os.makedirs(output_dir, exist_ok=True)
+        html_path = os.path.join(output_dir, f"{block_code}_6_sides.html")
+        
+        html_content = get_block_svg_html(block, block_code)
+        
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+            
+        if os.path.exists(html_path):
+            print(f"  ✓ Generated 6-side SVG HTML for {block_code}: {html_path}")
+            return html_path
+        else:
+            print(f"  ✗ Failed to generate SVG HTML for {block_code}")
+            return None
+            
+    except Exception as e:
+        print(f"Error in generate_block_6_side_images: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def generate_all_blocks_master_html(blocks, output_path, job_label):
+    """
+    Generate a master HTML file showing all blocks with their 6-side SVG views.
+    Optimized for printing.
+    """
+    try:
+        from .modules.svg_renderer import generate_svg_for_block_side
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>{job_label} - All Blocks 6-Side Views</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: #f8fafc;
+            padding: 15px;
+            color: #1e293b;
+        }}
+        
+        .page-header {{
+            background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+            color: white;
+            padding: 24px;
+            border-radius: 12px;
+            margin-bottom: 24px;
+            text-align: center;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }}
+        
+        .page-header h1 {{
+            font-size: 26px;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }}
+        
+        .page-header p {{
+            font-size: 14px;
+            opacity: 0.85;
+        }}
+        
+        .block-section {{
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+            page-break-after: always;
+            page-break-inside: avoid;
+        }}
+        
+        .block-section:last-child {{
+            page-break-after: auto;
+        }}
+        
+        .block-header {{
+            border-bottom: 2px solid #e2e8f0;
+            padding-bottom: 12px;
+            margin-bottom: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        
+        .block-title {{
+            font-size: 20px;
+            font-weight: 700;
+            color: #0f172a;
+        }}
+        
+        .block-info {{
+            font-size: 13px;
+            color: #64748b;
+        }}
+        
+        .views-grid {{
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+        }}
+        
+        .view-item {{
+            border: 1px solid #f1f5f9;
+            border-radius: 8px;
+            padding: 12px;
+            background: #ffffff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }}
+        
+        .view-label {{
+            font-size: 11px;
+            font-weight: 600;
+            color: #475569;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }}
+        
+        .view-plot {{
+            width: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }}
+        
+        /* Print-specific styles */
+        @media print {{
+            body {{
+                background: white;
+                padding: 0;
+            }}
+            
+            @page {{
+                size: A4 landscape;
+                margin: 8mm;
+            }}
+            
+            .page-header {{
+                background: white !important;
+                color: black !important;
+                border: 2px solid #0f172a;
+                padding: 15px;
+                margin-bottom: 20px;
+                box-shadow: none;
+                page-break-after: avoid;
+            }}
+            
+            .block-section {{
+                box-shadow: none;
+                border: 2px solid #e2e8f0;
+                page-break-after: always;
+                padding: 15px;
+            }}
+            
+            .block-section:last-child {{
+                page-break-after: auto;
+            }}
+            
+            .print-button {{
+                display: none !important;
+            }}
+            
+            .views-grid {{
+                grid-template-columns: repeat(3, 1fr) !important;
+                gap: 10px !important;
+            }}
+            
+            .view-item {{
+                border: 1px solid #e2e8f0 !important;
+                page-break-inside: avoid;
+            }}
+        }}
+        
+        /* Print button */
+        .print-button {{
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            color: white;
+            border: none;
+            padding: 14px 28px;
+            border-radius: 50px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 4px 15px rgba(15, 23, 42, 0.3);
+            z-index: 1000;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        
+        .print-button:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(15, 23, 42, 0.5);
+        }}
+    </style>
+</head>
+<body>
+    <button class="print-button" onclick="window.print()">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"></polyline><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path><rect x="6" y="14" width="12" height="8"></rect></svg>
+        Print Report
+    </button>
+    
+    <div class="page-header">
+        <h1>{job_label} - Optimization Results</h1>
+        <p>Generated: {datetime.now().strftime('%B %d, %Y at %H:%M')} | Total Blocks: {len(blocks)}</p>
+    </div>
+"""
+        
+        sides = ['Front', 'Back', 'Left', 'Right', 'Top', 'Bottom']
+        
+        for block in blocks:
+            efficiency = block.get_efficiency()
+            size = block.size
+            volume = block.volume
+            
+            html_content += f"""
+    <div class="block-section">
+        <div class="block-header">
+            <span class="block-title">Block {block.unique_code}</span>
+            <span class="block-info">
+                <strong>Efficiency:</strong> {efficiency:.2f}% &nbsp;|&nbsp; 
+                <strong>Size:</strong> {size[0]:.0f} × {size[1]:.0f} × {size[2]:.0f} mm &nbsp;|&nbsp; 
+                <strong>Volume:</strong> {volume:,.0f} mm³
+            </span>
+        </div>
+        <div class="views-grid">
+"""
+            for side in sides:
+                svg_markup = generate_svg_for_block_side(block, side)
+                html_content += f"""
+            <div class="view-item">
+                <div class="view-label">{side} view</div>
+                <div class="view-plot">
+                    {svg_markup}
+                </div>
+            </div>
+"""
+            html_content += """
+        </div>
+    </div>
+"""
+            
+        html_content += """
+</body>
+</html>
+"""
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+            
+        print(f"✓ Generated SVG-optimized master HTML: {output_path}")
+        return output_path
+        
+    except Exception as e:
+        print(f"Error in generate_all_blocks_master_html: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 
 from .models import (
     StockBlock,
@@ -247,6 +530,164 @@ def upload_excel_file(request):
 # VISUALIZATION FUNCTIONS
 # ================================
 
+@api_view(['GET', 'HEAD'])
+@permission_classes([IsAuthenticated])
+def download_block_visualization(request, block_code):
+    """
+    Generate and download a block visualization HTML file.
+    GET /api/visualization/block/<block_code>/download/?job_id=7
+    """
+    try:
+        from django.conf import settings
+        from django.core.cache import cache
+        import zipfile, io
+
+        helper = cache.get("latest_helper")
+        if helper is None:
+            return Response({"success": False, "error": "Optimization data not ready."}, status=400)
+
+        block = next((b for b in helper.all_big_blocks if b.unique_code == block_code), None)
+        if block is None:
+            return Response({"success": False, "error": f"Block {block_code} not found"}, status=404)
+
+        viz_dir = os.path.join(settings.MEDIA_ROOT, "visualizations")
+        os.makedirs(viz_dir, exist_ok=True)
+
+        job_id = request.GET.get("job_id", "OPT")
+        job_label = f"OPT-{str(job_id).zfill(4)}" if str(job_id).isdigit() else str(job_id)
+        filename = f"{job_label}_{block_code}_3D-Visualization.html"
+        filepath = os.path.join(viz_dir, filename)
+
+        block.draw_it(only_scrap=False, save_path=filepath)
+
+        if not os.path.exists(filepath):
+            return Response({"success": False, "error": "Failed to generate visualization file."}, status=500)
+
+        response = FileResponse(open(filepath, "rb"), content_type="text/html")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return Response({"success": False, "error": str(e)}, status=500)
+
+
+@api_view(['GET', 'HEAD'])
+@permission_classes([IsAuthenticated])
+def download_block_images(request, block_code):
+    """
+    Download 6-side HTML view of a block.
+    GET /api/visualization/block/<block_code>/images/?job_id=7
+    """
+    try:
+        from django.conf import settings
+        
+        job_id = request.GET.get("job_id", "")
+        if not job_id:
+            return Response({"success": False, "error": "job_id parameter required"}, status=400)
+        
+        # Path where HTML files are stored
+        html_dir = os.path.join(settings.MEDIA_ROOT, "block_html", str(job_id))
+        html_path = os.path.join(html_dir, f"{block_code}_6_sides.html")
+        
+        if not os.path.exists(html_path):
+            return Response({"success": False, "error": "Block HTML not found. Run optimization first."}, status=404)
+        
+        job_label = f"OPT-{str(job_id).zfill(4)}"
+        filename = f"{job_label}_{block_code}_6-Sides.html"
+        
+        response = FileResponse(open(html_path, "rb"), content_type="text/html")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return Response({"success": False, "error": str(e)}, status=500)
+
+
+@api_view(['GET', 'HEAD'])
+@permission_classes([IsAuthenticated])
+def download_all_blocks_zip(request):
+    """
+    Download master HTML with ALL blocks and their 6-side views.
+    GET /api/visualization/blocks/download-all/?job_id=7
+    """
+    try:
+        from django.conf import settings
+        
+        job_id = request.GET.get("job_id", "")
+        if not job_id:
+            return Response({"success": False, "error": "job_id parameter required"}, status=400)
+        
+        job_label = f"OPT-{str(job_id).zfill(4)}" if str(job_id).isdigit() else str(job_id)
+        
+        # Path to master HTML
+        html_dir = os.path.join(settings.MEDIA_ROOT, "block_html", str(job_id))
+        master_html_path = os.path.join(html_dir, f"{job_label}_All_Blocks_6_Sides.html")
+        
+        if not os.path.exists(master_html_path):
+            return Response({"success": False, "error": "Master HTML not found. Run optimization first."}, status=404)
+        
+        filename = f"{job_label}_All_Blocks_6_Sides.html"
+        
+        response = FileResponse(open(master_html_path, "rb"), content_type="text/html")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return Response({"success": False, "error": str(e)}, status=500)
+
+
+@api_view(['GET', 'HEAD'])
+@permission_classes([AllowAny])
+def view_all_blocks(request):
+    """
+    View master HTML with ALL blocks inline (not as download).
+    The browser renders the HTML directly so CDN scripts (Plotly) can load.
+    Auth is via ?token= query parameter since this opens in a new browser tab.
+    GET /api/visualization/blocks/view-all/?job_id=7&token=<JWT>
+    """
+    try:
+        from django.conf import settings
+        from rest_framework_simplejwt.tokens import AccessToken
+        
+        # Auth via query param (can't send headers when opening in new tab)
+        token = request.GET.get("token", "")
+        if not token:
+            return Response({"error": "Authentication required"}, status=401)
+        
+        try:
+            AccessToken(token)  # Validates the token
+        except Exception:
+            return Response({"error": "Invalid or expired token"}, status=401)
+        
+        job_id = request.GET.get("job_id", "")
+        if not job_id:
+            return Response({"error": "job_id parameter required"}, status=400)
+        
+        job_label = f"OPT-{str(job_id).zfill(4)}" if str(job_id).isdigit() else str(job_id)
+        
+        html_dir = os.path.join(settings.MEDIA_ROOT, "block_html", str(job_id))
+        master_html_path = os.path.join(html_dir, f"{job_label}_All_Blocks_6_Sides.html")
+        
+        if not os.path.exists(master_html_path):
+            return Response({"error": "Master HTML not found. Run optimization first."}, status=404)
+        
+        # Serve inline (no Content-Disposition: attachment) so browser renders it
+        response = FileResponse(open(master_html_path, "rb"), content_type="text/html")
+        response["Content-Disposition"] = f'inline; filename="{job_label}_All_Blocks_6_Sides.html"'
+        return response
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return Response({"error": str(e)}, status=500)
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def generate_block_visualization(request, block_code):
@@ -291,7 +732,6 @@ def generate_block_visualization(request, block_code):
         # Generate visualization
         filename = f"block_{block.unique_code}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
         filepath = os.path.join(viz_dir, filename)
-        
         try:
             # FIX: Pass save_path parameter to actually save the file
             block.draw_it(only_scrap=False, save_path=filepath)
@@ -361,7 +801,6 @@ def generate_scrap_visualization(request, scrap_code):
 
         filename = f"scrap_{scrap.unique_code}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
         filepath = os.path.join(viz_dir, filename)
-
         scrap.draw_scrap(save_path=filepath)
 
         for _ in range(30):
@@ -384,7 +823,7 @@ def generate_scrap_visualization(request, scrap_code):
 
 
 
-@api_view(['GET'])
+@api_view(['GET', 'HEAD'])
 def get_visualization_file(request, filename):
     """
     Serve visualization HTML file
@@ -995,10 +1434,56 @@ def upload_and_optimize(request):
                     prism_summary=prism_summary
                 )
                 
+                # Build a professional, industry-style job name:
+                # e.g. "OPT-0007 · SteelParts Jul11" instead of "Run #7 - sample_data"
+                raw_stem = os.path.splitext(excel_file.name)[0]          # e.g. "sample_data"
+                clean_stem = raw_stem.replace('_', ' ').replace('-', ' ').strip().title()  # "Sample Data"
+                date_tag = timezone.now().strftime("%d %b %y")            # "11 Jul 26"
+                history.job_name = f"OPT-{history.id:04d} \u00b7 {clean_stem} \u00b7 {date_tag}"
+                history.save(update_fields=['job_name'])
+                
                 history_id = history.id
                 history_saved = True
                 print(f"[HISTORY] Saved optimization #{history.id} for user {request.user.username}")
+
+                # ====================
+                # 8. GENERATE 6-SIDE HTML FOR ALL BLOCKS (FAST!)
+                # ====================
+                print(f"\n{'='*80}")
+                print("GENERATING 6-SIDE HTML FILES FOR ALL BLOCKS")
+                print(f"{'='*80}")
                 
+                html_base_dir = os.path.join(settings.MEDIA_ROOT, "block_html", str(history.id))
+                os.makedirs(html_base_dir, exist_ok=True)
+                
+                # Generate individual block HTML files
+                for block in helper.all_big_blocks:
+                    try:
+                        print(f"\nGenerating HTML for block {block.unique_code}...")
+                        html_path = generate_block_6_side_images(block, html_base_dir, block.unique_code)
+                        
+                        if html_path:
+                            print(f"✓ Successfully generated HTML for {block.unique_code}")
+                        else:
+                            print(f"⚠ Failed to generate HTML for {block.unique_code}")
+                    except Exception as e:
+                        print(f"✗ Error generating HTML for {block.unique_code}: {e}")
+                        continue
+                
+                # Generate master HTML with all blocks
+                job_label = f"OPT-{history.id:04d}"
+                master_html_path = os.path.join(html_base_dir, f"{job_label}_All_Blocks_6_Sides.html")
+                generate_all_blocks_master_html(helper.all_big_blocks, master_html_path, job_label)
+                
+                print(f"\n{'='*80}\n")
+
+                # Auto-save scraps to database (initially not in inventory)
+                try:
+                    from .inventory_views import auto_save_scraps_from_optimization
+                    auto_save_scraps_from_optimization(helper, history, request.user)
+                except Exception as inv_err:
+                    print(f"[INVENTORY] Error saving scraps (non-critical): {inv_err}")
+
         except ImportError as ie:
             print(f"[HISTORY] OptimizationHistory model not found: {ie}")
         except Exception as history_error:
@@ -1158,38 +1643,48 @@ def set_optimization_settings(request):
 @permission_classes([IsAuthenticated])
 def get_optimization_history(request):
     """
-    Get optimization history for the current user
-    
     GET /api/optimization-history/
-    Returns list of all optimizations with summary
+    - Normal users: see only their own history
+    - Superadmin/staff: see all users' history (pass all_users=true)
+    - Search: ?search=<id or job name>
     """
     try:
         from .models import OptimizationHistory
-        
-        # Get pagination parameters
-        page = int(request.GET.get('page', 1))
-        page_size = int(request.GET.get('page_size', 10))
-        
-        # Query history for current user
-        history = OptimizationHistory.objects.filter(user=request.user)
-        
-        # Get total count
+        from django.db.models import Q
+
+        page = max(1, int(request.GET.get('page', 1)))
+        page_size = min(100, max(1, int(request.GET.get('page_size', 50))))
+        search = request.GET.get('search', '').strip()
+        show_all = request.GET.get('all_users', 'false').lower() == 'true'
+
+        # Superadmin/staff can see everyone's history
+        if show_all and (request.user.is_superuser or request.user.is_staff):
+            history = OptimizationHistory.objects.select_related('user').all()
+        else:
+            history = OptimizationHistory.objects.filter(user=request.user)
+
+        # Search by numeric ID or job name
+        if search:
+            clean_search = search.lstrip('#').strip()
+            if clean_search.isdigit():
+                history = history.filter(
+                    Q(id=clean_search) | Q(job_name__icontains=search)
+                )
+            else:
+                history = history.filter(job_name__icontains=search)
+
         total_count = history.count()
-        
-        # Paginate
         start = (page - 1) * page_size
         end = start + page_size
         paginated_history = history[start:end]
-        
-        # Prepare response - return summary property
+
         history_list = []
         for item in paginated_history:
-            # Use the summary property you defined in the model
             summary = item.summary
-            # Add any additional fields if needed
             summary['id'] = item.id
+            summary['username'] = item.user.username if hasattr(item, 'user') else None
             history_list.append(summary)
-        
+
         return Response({
             'success': True,
             'data': history_list,
@@ -1197,22 +1692,16 @@ def get_optimization_history(request):
                 'page': page,
                 'page_size': page_size,
                 'total': total_count,
-                'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0,
+                'total_pages': max(1, (total_count + page_size - 1) // page_size),
                 'has_next': end < total_count,
-                'has_previous': page > 1
+                'has_previous': page > 1,
             }
         })
-        
+
     except Exception as e:
-        print(f"[HISTORY] Error fetching history: {e}")
         import traceback
         traceback.print_exc()
-        
-        return Response({
-            'success': False,
-            'error': str(e),
-            'data': []  # Always return empty array on error
-        }, status=500)
+        return Response({'success': False, 'error': str(e), 'data': []}, status=500)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -1227,7 +1716,10 @@ def get_optimization_details(request, history_id):
         from .models import OptimizationHistory
         
         # Get the history item
-        history = OptimizationHistory.objects.get(id=history_id, user=request.user)
+        if request.user.is_superuser or request.user.is_staff:
+            history = OptimizationHistory.objects.get(id=history_id)
+        else:
+            history = OptimizationHistory.objects.get(id=history_id, user=request.user)
         
         return Response({
             'success': True,
@@ -1242,6 +1734,10 @@ def get_optimization_details(request, history_id):
                 'selected_parents': history.selected_parents,
                 'parameters': history.parameters,
                 'optimization_results': history.optimization_results,
+                'is_executed': history.is_executed,
+                'label': history.label,
+                'label_color': history.label_color,
+                'username': history.user.username,
                 'summary': {
                     'total_blocks_created': history.total_blocks_created,
                     'total_parts_packed': history.total_parts_packed,
@@ -1357,6 +1853,51 @@ def rename_optimization(request, history_id):
         return Response({
             'success': False,
             'error': str(e)
+        }, status=500)
+
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def toggle_executed(request, history_id):
+    """
+    Toggle the is_executed status of an optimization
+    
+    PATCH /api/optimization-history/<id>/toggle-executed/
+    Body: {"is_executed": true}
+    """
+    try:
+        from .models import OptimizationHistory
+        
+        # Get the history item
+        if request.user.is_superuser or request.user.is_staff:
+            history = OptimizationHistory.objects.get(id=history_id)
+        else:
+            history = OptimizationHistory.objects.get(id=history_id, user=request.user)
+        
+        # Get new status from request
+        new_status = request.data.get('is_executed', False)
+        
+        # Update status
+        history.is_executed = new_status
+        history.save()
+        
+        return Response({
+            'success': True,
+            'is_executed': history.is_executed,
+            'label': history.label,
+            'label_color': history.label_color,
+            'message': f'Optimization marked as {"executed" if new_status else "not executed"}'
+        })
+        
+    except OptimizationHistory.DoesNotExist:
+        return Response({
+            'success': False,
+            'detail': 'Optimization not found or access denied'
+        }, status=404)
+    except Exception as e:
+        return Response({
+            'success': False,
+            'detail': str(e)
         }, status=500)
 
 
