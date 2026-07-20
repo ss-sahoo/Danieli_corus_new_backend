@@ -91,8 +91,14 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
 
     # 2. Draw placed prisms
     if draw_prisms and block.prism_details:
-        unique_codes = sorted(list(set(getattr(p_detail['prism'], 'code', 'Part') for p_detail in block.prism_details)))
-        color_map = {code: colors[idx % len(colors)] for idx, code in enumerate(unique_codes)}
+        # Deterministic global color map by hashing the mark code
+        color_map = {}
+        for detail in block.prism_details:
+            prism = detail['prism']
+            p_code = getattr(prism, 'code', getattr(prism, 'unique_code', 'Part'))
+            if p_code not in color_map:
+                sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(str(p_code)))
+                color_map[p_code] = colors[sum_chars % len(colors)]
         
         prism_idx = 0
         for detail in block.prism_details:

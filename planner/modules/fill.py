@@ -164,7 +164,7 @@ pio.renderers.default = "browser"
 
 
 def draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edges=[], 
-         planes={"xy_planes":[],"zx_planes":[],"yz_planes":[],}, scrap_volumes =[]):
+         planes={"xy_planes":[],"zx_planes":[],"yz_planes":[],}, scrap_volumes =[], prism_colors=None):
 
     # Big block (8 corner coordinates)
     big_block = np.array(big_block_coordinate)
@@ -326,23 +326,17 @@ def draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edge
     # Draw prisms with different colors
     colors = ["red", "green", "blue", "orange", "purple", "cyan"]
 
-    
     for i, scrap_coordinate in enumerate(scrap_volumes):
-        color = colors[i % len(colors)]
+        color = "#EF4444"  # Consistent light red color for scraps
         sv = np.array(scrap_coordinate)
         fig.add_trace(prism_mesh(sv, color=color, opacity=0.15))
-        fig.add_trace(prism_edges(sv, color='rgba(0,0,0,0.4)', width=2))
+        fig.add_trace(prism_edges(sv, color='rgba(239, 68, 68, 0.4)', width=2))
 
-    '''i =0
-    for scrap_coordinate in scrap_volumes:
-        color = colors[i]
-        i+=1
-        fig.add_trace(prism_mesh(np.array(scrap_coordinate), color=color, opacity=0.15))'''
-    
-    
-    
     for idx, p in enumerate(prisms):
-        color = colors[idx % len(colors)]
+        if prism_colors and idx < len(prism_colors):
+            color = prism_colors[idx]
+        else:
+            color = colors[idx % len(colors)]
         fig.add_trace(prism_mesh(p, color=color, opacity=0.9))
         fig.add_trace(prism_edges(p, color='black', width=2))
 

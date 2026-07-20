@@ -171,6 +171,16 @@ class Block:
         big_block_coordinate = self.box_coordinate
         co_ordinates_list = self.all_prisms_coordinates
         scrap_volumes = [s.box_coordinate for s in self.scraps]
+        
+        # Color mapping logic matching svg_renderer.py exactly for visual consistency
+        colors_palette = ["#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#EF4444", "#06B6D4"]
+        
+        prism_colors = []
+        for detail in self.prism_details:
+            prism_code = getattr(detail['prism'], 'code', 'Part')
+            sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(str(prism_code)))
+            color = colors_palette[sum_chars % len(colors_palette)]
+            prism_colors.extend([color] * len(detail['coordinates']))
     
         fig = draw(
             big_block_coordinate,
@@ -179,7 +189,8 @@ class Block:
             y_edges=[],
             z_edges=[],
             planes={"xy_planes": [], "zx_planes": [], "yz_planes": []},
-            scrap_volumes=scrap_volumes if only_scrap else []
+            scrap_volumes=scrap_volumes if only_scrap else [],
+            prism_colors=prism_colors
         )
         
         if save_path and fig:
