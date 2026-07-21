@@ -89,6 +89,22 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
             area -= float(pts[j][0]) * float(pts[i][1])
         return abs(area) / 2.0
 
+    def get_cam_depth(v3d_list):
+        if not v3d_list: return 0
+        cx = sum(v[0] for v in v3d_list) / float(len(v3d_list))
+        cy = sum(v[1] for v in v3d_list) / float(len(v3d_list))
+        cz = sum(v[2] for v in v3d_list) / float(len(v3d_list))
+        if side_name == 'Front': return cy
+        if side_name == 'Back': return -cy
+        if side_name == 'Left': return cx
+        if side_name == 'Right': return -cx
+        if side_name == 'Top': return -cz
+        if side_name == 'Bottom': return cz
+        return 0
+
+    polygons_drawn = 0
+    render_elements = []  # tuple of (depth, svg_string)
+    
     # 2. Draw placed prisms
     if draw_prisms and block.prism_details:
         # Deterministic global color map by hashing the mark code
@@ -96,35 +112,73 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
         for detail in block.prism_details:
             prism = detail['prism']
             p_code = getattr(prism, 'code', getattr(prism, 'unique_code', 'Part'))
-            if p_code not in color_map:
-                sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(str(p_code)))
-                color_map[p_code] = colors[sum_chars % len(colors)]
+            p_code_clean = str(p_code).strip()
+            if p_code_clean not in color_map:
+                sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(p_code_clean))
+                color_map[p_code_clean] = colors[sum_chars % len(colors)]
         
         prism_idx = 0
         for detail in block.prism_details:
             prism = detail['prism']
             p_code = getattr(prism, 'code', getattr(prism, 'unique_code', 'Part'))
+            p_code_clean = str(p_code).strip()
             p_size_str = "x".join(f"{s:.0f}" for s in prism.size) if hasattr(prism, 'size') else ""
-            title_tooltip = f"Part: {p_code} | Size: {p_size_str} mm"
-            color = color_map.get(p_code, "#4F46E5")
+            title_tooltip = f"Part: {p_code_clean} | Size: {p_size_str} mm"
+            color = color_map.get(p_code_clean, "#4F46E5")
             
             for coords in detail['coordinates']:
                 for face in faces_indices:
                     pts = [project_vertex(coords[v_idx]) for v_idx in face]
                     if get_poly_area(pts) > 0.1:
                         pts_str = " ".join(f"{pt[0]:.1f},{pt[1]:.1f}" for pt in pts)
-                        svg_str += f'<polygon points="{pts_str}" fill="{color}" stroke="rgba(255,255,255,0.75)" stroke-width="1" stroke-linejoin="round">'
-                        svg_str += f'<title>{title_tooltip}</title>'
-                        svg_str += '</polygon>'
+                        poly_svg = f'<polygon points="{pts_str}" fill="{color}" stroke="rgba(255,255,255,0.75)" stroke-width="1" stroke-linejoin="round">'
+                        poly_svg += f'<title>{title_tooltip}</title>'
+                        poly_svg += '</polygon>'
+                        
+                        v3d_list = [coords[v_idx] for v_idx in face]
+                        depth = get_cam_depth(v3d_list)
+                        render_elements.append((depth, poly_svg))
+                        polygons_drawn += 1
+                
+                # Concise labeling for G14, G15, G17, G18, G19, G20, G21 component blocks
+                p_code_upper = p_code_clean.upper()
+                if any(x in p_code_upper for x in ['G14', 'G15', 'G17', 'G18', 'G19', 'G20', 'G21']) or (p_code_upper.startswith('G') and len(p_code_upper) <= 5):
+                    projected_pts = [project_vertex(v) for v in coords]
+                    xs = [pt[0] for pt in projected_pts]
+                    ys = [pt[1] for pt in projected_pts]
+                    min_x, max_x = min(xs), max(xs)
+                    min_y, max_y = min(ys), max(ys)
+                    width = max_x - min_x
+                    height = max_y - min_y
+                    
+                    if width > 8.0 and height > 8.0:
+                        cx = (min_x + max_x) / 2.0
+                        cy = (min_y + max_y) / 2.0
+                        # Adaptive text sizing based on the projected prism dimensions with no hardcoded small maximum
+                        font_sz = max(10.0, min(height * 0.35, width * 0.25))
+                        txt_el = f'<text x="{cx:.1f}" y="{cy:.1f}" text-anchor="middle" dominant-baseline="central" ' \
+                                 f'font-size="{font_sz:.1f}px" font-weight="700" fill="#ffffff" ' \
+                                 f'style="paint-order: stroke; stroke: #000000; stroke-width: 2px; stroke-linejoin: round; pointer-events: none;">' \
+                                 f'{p_code_clean}</text>'
+                        
+                        # Depth positioning for the label (just in front of the front-most part of the prism)
+                        text_depth = min(get_cam_depth([v]) for v in coords) - 0.001
+                        render_elements.append((text_depth, txt_el))
                 prism_idx += 1
+                
+        # Draw z-sorted polygons and labels via Painter's algorithm
+        render_elements.sort(key=lambda x: x[0], reverse=True)
+        for _, svg_element in render_elements:
+            svg_str += svg_element
             
-    # 3. Draw scraps
-    for scrap in block.scraps:
-        if highlight_scrap is not None and getattr(scrap, 'unique_code', '') != getattr(highlight_scrap, 'unique_code', ''):
-            continue
-            
-        scrap_code = getattr(scrap, 'unique_code', 'Scrap')
-        scrap_size_str = "x".join(f"{s:.0f}" for s in scrap.size) if hasattr(scrap, 'size') else ""
+    # 3. Draw scraps (only if a specific scrap is being highlighted, to match 3D behavior)
+    if highlight_scrap is not None:
+        for scrap in block.scraps:
+            if getattr(scrap, 'unique_code', '') != getattr(highlight_scrap, 'unique_code', ''):
+                continue
+                
+            scrap_code = getattr(scrap, 'unique_code', 'Scrap')
+            scrap_size_str = "x".join(f"{s:.0f}" for s in scrap.size) if hasattr(scrap, 'size') else ""
         title_tooltip = f"Scrap | Size: {scrap_size_str} mm"
         
         for face in faces_indices:
@@ -146,6 +200,11 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
                 svg_str += f'<polygon points="{pts_str}" fill="{fill_col}" stroke="{stroke_col}" stroke-width="{stroke_w}" stroke-dasharray="{stroke_dash}">'
                 svg_str += f'<title>{title_tooltip}</title>'
                 svg_str += '</polygon>'
+                polygons_drawn += 1
+                
+    # Check if empty
+    if polygons_drawn == 0:
+        svg_str += f'<text x="{view_w/2}" y="{view_h/2}" font-size="16px" fill="#94A3B8" font-family="sans-serif" font-weight="600" text-anchor="middle" dominant-baseline="middle">Empty View</text>'
                 
     # 4. Draw outer border of the block
     svg_str += f'<rect x="0" y="0" width="{view_w}" height="{view_h}" fill="none" stroke="#1E293B" stroke-width="2.5" rx="3" />'
@@ -234,9 +293,45 @@ def get_block_svg_html(block, block_code):
                 grid-template-columns: 1fr;
             }}
         }}
+        .zoom-controls {{
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            z-index: 1000;
+        }}
+        .zoom-btn {{
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 44px;
+            height: 44px;
+            font-size: 20px;
+            cursor: pointer;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }}
+        .zoom-btn:hover {{ background: #334155; transform: scale(1.1); }}
+        @media print {{
+            .zoom-controls {{ display: none !important; }}
+        }}
     </style>
 </head>
 <body>
+    <div class="zoom-controls">
+        <button class="zoom-btn" onclick="zoomPage(0.1)" title="Zoom In">➕</button>
+        <button class="zoom-btn" onclick="resetZoom()" title="Reset Zoom">🏠</button>
+        <button class="zoom-btn" onclick="zoomPage(-0.1)" title="Zoom Out">➖</button>
+    </div>
+    
+    <div id="zoomable-content" style="transform-origin: top left; transition: transform 0.1s; will-change: transform;">
+    
     <div class="header">
         <h1>Block {block_code} - 6-Side Views</h1>
         <p>Size: {L:.0f} × {W:.0f} × {H:.0f} mm | Efficiency: {efficiency:.2f}% | Volume: {volume:,.0f} mm³</p>
@@ -252,8 +347,63 @@ def get_block_svg_html(block, block_code):
             </div>
         </div>
 """
+    
     html += """
     </div>
+    </div>
+    <script>
+        let currentZoom = 1;
+        let pannedX = 0;
+        let pannedY = 0;
+        let isDragging = false;
+        let startX, startY;
+        
+        const el = document.getElementById('zoomable-content');
+        
+        function updateTransform() {
+            el.style.transform = `translate(${pannedX}px, ${pannedY}px) scale(${currentZoom})`;
+        }
+        
+        function zoomPage(delta) {
+            currentZoom += delta;
+            if (currentZoom < 0.2) currentZoom = 0.2;
+            updateTransform();
+        }
+        
+        function resetZoom() {
+            currentZoom = 1;
+            pannedX = 0;
+            pannedY = 0;
+            updateTransform();
+        }
+        
+        document.addEventListener('mousedown', (e) => {
+            if (e.target.closest('.zoom-btn') || e.target.closest('.print-button')) return;
+            isDragging = true;
+            startX = e.clientX - pannedX;
+            startY = e.clientY - pannedY;
+            document.body.style.cursor = 'grabbing';
+            // Optional: prevent default if you don't want text selection while dragging
+            // e.preventDefault(); 
+        });
+        
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            pannedX = e.clientX - startX;
+            pannedY = e.clientY - startY;
+            updateTransform();
+        });
+        
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+            document.body.style.cursor = 'auto';
+        });
+        
+        document.addEventListener('mouseleave', () => {
+            isDragging = false;
+            document.body.style.cursor = 'auto';
+        });
+    </script>
 </body>
 </html>
 """
@@ -336,9 +486,45 @@ def get_scrap_svg_html(scrap, scrap_code):
                 grid-template-columns: 1fr;
             }}
         }}
+        .zoom-controls {{
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            z-index: 1000;
+        }}
+        .zoom-btn {{
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 44px;
+            height: 44px;
+            font-size: 20px;
+            cursor: pointer;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }}
+        .zoom-btn:hover {{ background: #334155; transform: scale(1.1); }}
+        @media print {{
+            .zoom-controls {{ display: none !important; }}
+        }}
     </style>
 </head>
 <body>
+    <div class="zoom-controls">
+        <button class="zoom-btn" onclick="zoomPage(0.1)" title="Zoom In">➕</button>
+        <button class="zoom-btn" onclick="resetZoom()" title="Reset Zoom">🏠</button>
+        <button class="zoom-btn" onclick="zoomPage(-0.1)" title="Zoom Out">➖</button>
+    </div>
+    
+    <div id="zoomable-content" style="transform-origin: top left; transition: transform 0.1s; will-change: transform;">
+    
     <div class="header">
         <h1>Scrap {scrap_code} Location in Parent Block</h1>
         <p>Parent Block Size: {L:.0f} × {W:.0f} × {H:.0f} mm | Scrap Volume: {scrap.volume:,.0f} mm³</p>
@@ -354,8 +540,63 @@ def get_scrap_svg_html(scrap, scrap_code):
             </div>
         </div>
 """
+    
     html += """
     </div>
+    </div>
+    <script>
+        let currentZoom = 1;
+        let pannedX = 0;
+        let pannedY = 0;
+        let isDragging = false;
+        let startX, startY;
+        
+        const el = document.getElementById('zoomable-content');
+        
+        function updateTransform() {
+            el.style.transform = `translate(${pannedX}px, ${pannedY}px) scale(${currentZoom})`;
+        }
+        
+        function zoomPage(delta) {
+            currentZoom += delta;
+            if (currentZoom < 0.2) currentZoom = 0.2;
+            updateTransform();
+        }
+        
+        function resetZoom() {
+            currentZoom = 1;
+            pannedX = 0;
+            pannedY = 0;
+            updateTransform();
+        }
+        
+        document.addEventListener('mousedown', (e) => {
+            if (e.target.closest('.zoom-btn') || e.target.closest('.print-button')) return;
+            isDragging = true;
+            startX = e.clientX - pannedX;
+            startY = e.clientY - pannedY;
+            document.body.style.cursor = 'grabbing';
+            // Optional: prevent default if you don't want text selection while dragging
+            // e.preventDefault(); 
+        });
+        
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            pannedX = e.clientX - startX;
+            pannedY = e.clientY - startY;
+            updateTransform();
+        });
+        
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+            document.body.style.cursor = 'auto';
+        });
+        
+        document.addEventListener('mouseleave', () => {
+            isDragging = false;
+            document.body.style.cursor = 'auto';
+        });
+    </script>
 </body>
 </html>
 """

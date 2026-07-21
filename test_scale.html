@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; border: 1px solid red;}
+        .card { height: 200px; background: pink; border: 1px solid black; }
+    </style>
+</head>
+<body>
+    <div id="zoomable-content" style="transform-origin: top left; transition: transform 0.2s;">
+        <div class="grid">
+            <div class="card">A</div><div class="card">B</div><div class="card">C</div>
+            <div class="card">D</div><div class="card">E</div><div class="card">F</div>
+        </div>
+    </div>
+    
+    <div style="position:fixed; bottom:10px; right:10px;">
+        <button onclick="z(0.2)">+</button>
+        <button onclick="z(-0.2)">-</button>
+    </div>
+    
+    <script>
+        let cur = 1;
+        function z(d) {
+            cur += d;
+            let el = document.getElementById('zoomable-content');
+            el.style.transform = `scale(${cur})`;
+            el.style.width = `${100 / cur}%`;
+        }
+    </script>
+</body>
+</html>

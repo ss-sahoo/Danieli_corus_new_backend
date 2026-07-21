@@ -178,7 +178,8 @@ class Block:
         prism_colors = []
         for detail in self.prism_details:
             prism_code = getattr(detail['prism'], 'code', 'Part')
-            sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(str(prism_code)))
+            prism_code_clean = str(prism_code).strip()
+            sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(prism_code_clean))
             color = colors_palette[sum_chars % len(colors_palette)]
             prism_colors.extend([color] * len(detail['coordinates']))
     

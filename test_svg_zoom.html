@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+</head>
+<body>
+    <div style="width: 500px; height: 300px; border: 1px solid #ccc; overflow: hidden; margin: 50px auto;">
+        <svg viewBox="0 0 1000 500" preserveAspectRatio="xMidYMid meet">
+            <rect x="100" y="50" width="800" height="400" fill="pink" />
+            <circle cx="500" cy="250" r="50" fill="red" />
+        </svg>
+    </div>
+    <script>
+    document.querySelectorAll('svg').forEach(svg => {
+        svg.style.cursor = 'grab';
+        let vb = svg.getAttribute('viewBox').split(' ').map(Number);
+        const originalVb = [...vb];
+        let isPanning = false, startX, startY;
+        
+        svg.addEventListener('wheel', e => {
+            e.preventDefault();
+            const zoom = e.deltaY > 0 ? 1.15 : 0.85;
+            const rect = svg.getBoundingClientRect();
+            const mx = e.clientX - rect.left;
+            const my = e.clientY - rect.top;
+            const svgX = vb[0] + (mx / rect.width) * vb[2];
+            const svgY = vb[1] + (my / rect.height) * vb[3];
+            const w = vb[2] * zoom;
+            const h = vb[3] * zoom;
+            vb[0] = svgX - (mx / rect.width) * w;
+            vb[1] = svgY - (my / rect.height) * h;
+            vb[2] = w;
+            vb[3] = h;
+            svg.setAttribute('viewBox', vb.join(' '));
+        }, { passive: false });
+        
+        svg.addEventListener('mousedown', e => {
+            isPanning = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            svg.style.cursor = 'grabbing';
+        });
+        
+        window.addEventListener('mousemove', e => {
+            if(!isPanning) return;
+            const rect = svg.getBoundingClientRect();
+            let dx = (startX - e.clientX) * (vb[2] / rect.width);
+            let dy = (startY - e.clientY) * (vb[3] / rect.height);
+            vb[0] += dx;
+            vb[1] += dy;
+            startX = e.clientX;
+            startY = e.clientY;
+            svg.setAttribute('viewBox', vb.join(' '));
+        });
+        
+        window.addEventListener('mouseup', () => {
+            isPanning = false;
+            svg.style.cursor = 'grab';
+        });
+        
+        svg.addEventListener('dblclick', () => {
+            vb = [...originalVb];
+            svg.setAttribute('viewBox', vb.join(' '));
+        });
+    });
+    </script>
+</body>
+</html>

@@ -246,13 +246,50 @@ def generate_all_blocks_master_html(blocks, output_path, job_label):
             transform: translateY(-2px);
             box-shadow: 0 6px 20px rgba(15, 23, 42, 0.5);
         }}
+        
+        .zoom-controls {{
+            position: fixed;
+            bottom: 90px;
+            right: 36px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            z-index: 1000;
+        }}
+        .zoom-btn {{
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 44px;
+            height: 44px;
+            font-size: 20px;
+            cursor: pointer;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }}
+        .zoom-btn:hover {{ background: #334155; transform: scale(1.1); }}
+        @media print {{
+            .zoom-controls {{ display: none !important; }}
+        }}
     </style>
 </head>
 <body>
+    <div class="zoom-controls">
+        <button class="zoom-btn" onclick="zoomPage(0.1)" title="Zoom In">➕</button>
+        <button class="zoom-btn" onclick="resetZoom()" title="Reset Zoom">🏠</button>
+        <button class="zoom-btn" onclick="zoomPage(-0.1)" title="Zoom Out">➖</button>
+    </div>
+    
     <button class="print-button" onclick="window.print()">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"></polyline><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path><rect x="6" y="14" width="12" height="8"></rect></svg>
         Print Report
     </button>
+    
+    <div id="zoomable-content" style="transform-origin: top left; transition: transform 0.1s; will-change: transform;">
     
     <div class="page-header">
         <h1>{job_label} - Optimization Results</h1>
@@ -295,6 +332,60 @@ def generate_all_blocks_master_html(blocks, output_path, job_label):
 """
             
         html_content += """
+    </div>
+    <script>
+        let currentZoom = 1;
+        let pannedX = 0;
+        let pannedY = 0;
+        let isDragging = false;
+        let startX, startY;
+        
+        const el = document.getElementById('zoomable-content');
+        
+        function updateTransform() {
+            el.style.transform = `translate(${pannedX}px, ${pannedY}px) scale(${currentZoom})`;
+        }
+        
+        function zoomPage(delta) {
+            currentZoom += delta;
+            if (currentZoom < 0.2) currentZoom = 0.2;
+            updateTransform();
+        }
+        
+        function resetZoom() {
+            currentZoom = 1;
+            pannedX = 0;
+            pannedY = 0;
+            updateTransform();
+        }
+        
+        document.addEventListener('mousedown', (e) => {
+            if (e.target.closest('.zoom-btn') || e.target.closest('.print-button')) return;
+            isDragging = true;
+            startX = e.clientX - pannedX;
+            startY = e.clientY - pannedY;
+            document.body.style.cursor = 'grabbing';
+            // Optional: prevent default if you don't want text selection while dragging
+            // e.preventDefault(); 
+        });
+        
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            pannedX = e.clientX - startX;
+            pannedY = e.clientY - startY;
+            updateTransform();
+        });
+        
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+            document.body.style.cursor = 'auto';
+        });
+        
+        document.addEventListener('mouseleave', () => {
+            isDragging = false;
+            document.body.style.cursor = 'auto';
+        });
+    </script>
 </body>
 </html>
 """
