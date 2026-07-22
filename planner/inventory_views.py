@@ -257,3 +257,56 @@ def mark_scraps_as_executed(optimization_history):
 
     print(f"[Inventory] Marked {updated} usable scraps in inventory for executed optimization #{optimization_history.id}")
     return updated
+
+
+@api_view(['PATCH', 'PUT'])
+@permission_classes([IsAuthenticated])
+def update_scrap(request, scrap_pk):
+    """
+    PATCH or PUT /api/inventory/<pk>/update/
+    Allows editing scrap dimensions (length, width, height) and recalculates volume/usability.
+    """
+    from .models import ScrapInventory
+
+    try:
+        scrap = ScrapInventory.objects.get(pk=scrap_pk)
+    except ScrapInventory.DoesNotExist:
+        return Response({'detail': 'Not found.'}, status=404)
+
+    data = request.data
+    try:
+        length = float(data['length'])
+        width = float(data['width'])
+        height = float(data['height'])
+    except (KeyError, ValueError, TypeError):
+        return Response({'detail': 'length, width, and height must be valid numbers.'}, status=400)
+
+    if length <= 0 or width <= 0 or height <= 0:
+        return Response({'detail': 'Dimensions must be positive numbers.'}, status=400)
+
+    scrap.length = length
+    scrap.width = width
+    scrap.height = height
+    scrap.volume = length * width * height
+
+    # Recalculate usability based on minimum dimension
+    min_dim = min(length, width, height)
+    if min_dim <= MIN_USABLE_MM:
+        scrap.usability = 'unusable'
+    else:
+        if scrap.usability == 'unusable':
+            scrap.usability = 'usable'
+
+    if 'notes' in data:
+        scrap.notes = str(data['notes'])
+
+    try:
+        scrap.save()
+        return Response({
+            'success': True,
+            'scrap': _serialize_scrap(scrap),
+            'message': f'Scrap {scrap.scrap_id} updated successfully.'
+        })
+    except Exception as e:
+        return Response({'detail': str(e)}, status=500)
+

@@ -298,11 +298,45 @@ def generate_all_blocks_master_html(blocks, output_path, job_label):
 """
         
         sides = ['Front', 'Back', 'Left', 'Right', 'Top', 'Bottom']
+        colors_palette = ["#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#EF4444", "#06B6D4"]
         
         for block in blocks:
             efficiency = block.get_efficiency()
             size = block.size
             volume = block.volume
+            
+            legend_items = []
+            seen_codes = set()
+            if getattr(block, 'prism_details', None):
+                for detail in block.prism_details:
+                    prism_code = getattr(detail['prism'], 'code', 'Part')
+                    prism_code_clean = str(prism_code).strip()
+                    if prism_code_clean not in seen_codes:
+                        seen_codes.add(prism_code_clean)
+                        sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(prism_code_clean))
+                        color = colors_palette[sum_chars % len(colors_palette)]
+                        legend_items.append((prism_code_clean, color))
+            
+            has_scraps = len(getattr(block, 'scraps', [])) > 0
+            legend_html = ""
+            if legend_items or has_scraps:
+                legend_html = '<div class="block-legend" style="display: flex; gap: 16px; margin: -4px 0 16px 0; flex-wrap: wrap; align-items: center; background: #f8fafc; padding: 10px 16px; border-radius: 8px; border: 1px solid #e2e8f0; width: 100%;">'
+                legend_html += '<span style="font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 4px;">Color Legend:</span>'
+                for code, color in legend_items:
+                    legend_html += f"""
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span style="width: 14px; height: 14px; background-color: {color}; border-radius: 4px; display: inline-block; border: 1px solid rgba(0,0,0,0.15);"></span>
+                        <span style="font-size: 12px; font-weight: 600; color: #334155;">{code}</span>
+                    </div>
+                    """
+                if has_scraps:
+                    legend_html += """
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <span style="width: 14px; height: 14px; background-color: rgba(239, 68, 68, 0.35); border: 1.5px dashed #EF4444; border-radius: 4px; display: inline-block;"></span>
+                        <span style="font-size: 12px; font-weight: 600; color: #334155;">Scrap</span>
+                    </div>
+                    """
+                legend_html += '</div>'
             
             html_content += f"""
     <div class="block-section">
@@ -314,6 +348,7 @@ def generate_all_blocks_master_html(blocks, output_path, job_label):
                 <strong>Volume:</strong> {volume:,.0f} mm³
             </span>
         </div>
+        {legend_html}
         <div class="views-grid">
 """
             for side in sides:

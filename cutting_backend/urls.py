@@ -25,6 +25,7 @@ from planner.inventory_views import (
     list_inventory,
     add_to_inventory,
     remove_from_inventory,
+    update_scrap,
 )
 
 urlpatterns = [
@@ -44,10 +45,10 @@ urlpatterns = [
     path("api/optimization-history/<int:history_id>/toggle-executed/", toggle_executed, name="toggle_executed"),
     path("api/optimization-history/<int:history_id>/label/", set_label, name="set_label"),
 
-    # Scrap Inventory (shared across all users)
     path("api/inventory/", list_inventory, name="list_inventory"),
     path("api/inventory/add/", add_to_inventory, name="add_to_inventory"),
     path("api/inventory/<int:scrap_pk>/remove/", remove_from_inventory, name="remove_from_inventory"),
+    path("api/inventory/<int:scrap_pk>/update/", update_scrap, name="update_scrap"),
 
     # API endpoints
     path('api/', include('planner.urls')),

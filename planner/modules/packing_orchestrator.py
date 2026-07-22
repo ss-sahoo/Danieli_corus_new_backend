@@ -70,6 +70,115 @@ class Prisms:
         return self.volume
 
 
+def wrap_plotly_fig_with_legend(fig, title, legend_items):
+    fig.update_layout(title="")
+    plotly_div = fig.to_html(full_html=False, include_plotlyjs='cdn')
+    
+    legend_html = ""
+    if legend_items:
+        legend_html = '<div class="legend-container" style="display: flex; gap: 16px; margin: 0 auto 20px auto; max-width: 900px; flex-wrap: wrap; align-items: center; justify-content: center; background: #ffffff; padding: 12px 24px; border-radius: 12px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">'
+        legend_html += '<span style="font-size: 12px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 4px;">Color Legend:</span>'
+        for label, col, is_scrap in legend_items:
+            if is_scrap:
+                color_style = f"background-color: {col}; border: 1.5px dashed #EF4444; width: 14px; height: 14px; border-radius: 4px; display: inline-block;"
+            else:
+                color_style = f"background-color: {col}; border: 1px solid rgba(0,0,0,0.15); width: 14px; height: 14px; border-radius: 4px; display: inline-block;"
+            legend_html += f"""
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="{color_style}"></span>
+                <span style="font-size: 13px; font-weight: 600; color: #334155;">{label}</span>
+            </div>
+            """
+        legend_html += '</div>'
+        
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>{title}</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: #f8fafc;
+            margin: 0;
+            padding: 24px 16px;
+            color: #1e293b;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            box-sizing: border-box;
+        }}
+        .card {{
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 16px;
+            width: 100%;
+            max-width: 950px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05),  0 8px 10px -6px rgba(0, 0, 0, 0.05);
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }}
+        .header {{
+            width: 100%;
+            text-align: center;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #e2e8f0;
+            padding-bottom: 16px;
+        }}
+        .header h1 {{
+            font-size: 20px;
+            font-weight: 700;
+            margin: 0 0 6px 0;
+            color: #0f172a;
+            letter-spacing: -0.025em;
+        }}
+        .plot-wrapper {{
+            width: 100%;
+            background: #ffffff;
+            border-radius: 12px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 10px;
+        }}
+        @media print {{
+            body {{
+                background: white;
+                color: black;
+                padding: 0;
+            }}
+            .card {{
+                background: white;
+                border: none;
+                box-shadow: none;
+                padding: 0;
+                color: black;
+            }}
+            .header h1 {{
+                color: black;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="header">
+            <h1>{title}</h1>
+        </div>
+        {legend_html}
+        <div class="plot-wrapper">
+            {plotly_div}
+        </div>
+    </div>
+</body>
+</html>
+"""
+    return html
+
+
 class Block:
     """Represents a stock block that can contain prisms"""
     
@@ -176,12 +285,23 @@ class Block:
         colors_palette = ["#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#EF4444", "#06B6D4"]
         
         prism_colors = []
+        legend_items = []
+        seen_codes = set()
         for detail in self.prism_details:
             prism_code = getattr(detail['prism'], 'code', 'Part')
             prism_code_clean = str(prism_code).strip()
             sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(prism_code_clean))
             color = colors_palette[sum_chars % len(colors_palette)]
             prism_colors.extend([color] * len(detail['coordinates']))
+            
+            if not only_scrap and prism_code_clean not in seen_codes:
+                seen_codes.add(prism_code_clean)
+                legend_items.append((prism_code_clean, color, False))
+                
+        if only_scrap:
+            legend_items.append(("Selected Scrap", "rgba(239, 68, 68, 0.5)", True))
+        elif len(scrap_volumes) > 0:
+            legend_items.append(("Scrap", "rgba(239, 68, 68, 0.2)", True))
     
         fig = draw(
             big_block_coordinate,
@@ -195,8 +315,10 @@ class Block:
         )
         
         if save_path and fig:
+            title = f"{'3D Scrap Location View' if only_scrap else 'Block Packing 3D Isometric View'} (Block {self.unique_code})"
+            html_content = wrap_plotly_fig_with_legend(fig, title, legend_items)
             with open(save_path, "w", encoding="utf-8") as f:
-                f.write(fig.to_html(full_html=True, include_plotlyjs='cdn'))
+                f.write(html_content)
                 
         return fig
 
@@ -232,7 +354,6 @@ class Scrap(Block):
             raise RuntimeError("draw() returned None for scrap visualization")
             
         fig.update_layout(
-            title=f"3D Scrap Visualization ({self.unique_code})",
             scene=dict(
                 aspectmode="data",
                 camera=dict(
@@ -251,8 +372,11 @@ class Scrap(Block):
         )
         
         if save_path:
+            legend_items = [("Selected Scrap", "rgba(239, 68, 68, 0.5)", True)]
+            title = f"Scrap Location View (Block {self.parent_block.unique_code} - Scrap {self.unique_code})"
+            html_content = wrap_plotly_fig_with_legend(fig, title, legend_items)
             with open(save_path, "w", encoding="utf-8") as f:
-                f.write(fig.to_html(full_html=True, include_plotlyjs='cdn'))
+                f.write(html_content)
                 
         return fig
 

@@ -224,6 +224,40 @@ def get_block_svg_html(block, block_code):
     sides = ['Front', 'Back', 'Left', 'Right', 'Top', 'Bottom']
     svgs = {side: generate_svg_for_block_side(block, side) for side in sides}
     
+    colors_palette = ["#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#EF4444", "#06B6D4"]
+    legend_items = []
+    seen_codes = set()
+    if block.prism_details:
+        for detail in block.prism_details:
+            prism_code = getattr(detail['prism'], 'code', 'Part')
+            prism_code_clean = str(prism_code).strip()
+            if prism_code_clean not in seen_codes:
+                seen_codes.add(prism_code_clean)
+                sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(prism_code_clean))
+                color = colors_palette[sum_chars % len(colors_palette)]
+                legend_items.append((prism_code_clean, color))
+                
+    has_scraps = len(block.scraps) > 0
+    legend_html = ""
+    if legend_items or has_scraps:
+        legend_html = '<div class="legend-container" style="display: flex; gap: 16px; margin: 0 auto 24px auto; max-width: 1400px; flex-wrap: wrap; align-items: center; justify-content: center; background: #ffffff; padding: 12px 24px; border-radius: 12px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">'
+        legend_html += '<span style="font-size: 12px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 4px;">Color Legend:</span>'
+        for code, color in legend_items:
+            legend_html += f"""
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="width: 16px; height: 16px; background-color: {color}; border-radius: 4px; display: inline-block; border: 1px solid rgba(0,0,0,0.15);"></span>
+                <span style="font-size: 13px; font-weight: 600; color: #334155;">{code}</span>
+            </div>
+            """
+        if has_scraps:
+            legend_html += """
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="width: 16px; height: 16px; background-color: rgba(239, 68, 68, 0.35); border: 1.5px dashed #EF4444; border-radius: 4px; display: inline-block;"></span>
+                <span style="font-size: 13px; font-weight: 600; color: #334155;">Scrap</span>
+            </div>
+            """
+        legend_html += '</div>'
+
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -336,6 +370,7 @@ def get_block_svg_html(block, block_code):
         <h1>Block {block_code} - 6-Side Views</h1>
         <p>Size: {L:.0f} × {W:.0f} × {H:.0f} mm | Efficiency: {efficiency:.2f}% | Volume: {volume:,.0f} mm³</p>
     </div>
+    {legend_html}
     <div class="grid">
 """
     for side in sides:
@@ -417,6 +452,15 @@ def get_scrap_svg_html(scrap, scrap_code):
     sides = ['Front', 'Back', 'Left', 'Right', 'Top', 'Bottom']
     svgs = {side: generate_svg_for_block_side(parent, side, highlight_scrap=scrap, draw_prisms=False) for side in sides}
     
+    legend_html = f"""
+    <div class="legend-container" style="display: flex; gap: 16px; margin: 0 auto 24px auto; max-width: 1400px; flex-wrap: wrap; align-items: center; justify-content: center; background: #ffffff; padding: 12px 24px; border-radius: 12px; border: 1px solid #e2e8f0; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="width: 16px; height: 16px; background-color: rgba(239, 68, 68, 0.5); border: 2px solid #EF4444; border-radius: 4px; display: inline-block;"></span>
+            <span style="font-size: 13px; font-weight: 600; color: #334155;">Selected Scrap</span>
+        </div>
+    </div>
+    """
+
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -529,6 +573,7 @@ def get_scrap_svg_html(scrap, scrap_code):
         <h1>Scrap {scrap_code} Location in Parent Block</h1>
         <p>Parent Block Size: {L:.0f} × {W:.0f} × {H:.0f} mm | Scrap Volume: {scrap.volume:,.0f} mm³</p>
     </div>
+    {legend_html}
     <div class="grid">
 """
     for side in sides:
