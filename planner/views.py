@@ -712,6 +712,16 @@ def ensure_up_to_date_visualizations(job_id):
         return
     try:
         from django.conf import settings
+        from django.core.cache import cache
+        
+        cache_key = f"regen_v3_{job_id}"
+        job_label = f"OPT-{int(job_id):04d}"
+        master_html_path = os.path.join(settings.MEDIA_ROOT, "block_html", str(job_id), f"{job_label}_All_Blocks_6_Sides.html")
+        
+        if cache.get(cache_key) and os.path.exists(master_html_path):
+            print(f"[REGENERATE] Job {job_id} already generated and files exist, skipping.")
+            return
+            
         from .models import OptimizationHistory
         from .modules.packing_orchestrator import Prisms, run_final_code
         
@@ -741,9 +751,8 @@ def ensure_up_to_date_visualizations(job_id):
         for block in helper.all_big_blocks:
             generate_block_6_side_images(block, html_base_dir, block.unique_code)
             
-        job_label = f"OPT-{history.id:04d}"
-        master_html_path = os.path.join(html_base_dir, f"{job_label}_All_Blocks_6_Sides.html")
         generate_all_blocks_master_html(helper.all_big_blocks, master_html_path, job_label)
+        cache.set(cache_key, True, timeout=None)
         print(f"[REGENERATE] Successfully regenerated visualizations for job {job_id}")
     except Exception as e:
         print(f"[REGENERATE] Failed to regenerate: {e}")
