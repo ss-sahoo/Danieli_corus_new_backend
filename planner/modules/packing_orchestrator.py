@@ -282,7 +282,14 @@ class Block:
         scrap_volumes = [s.box_coordinate for s in self.scraps]
         
         # Color mapping logic matching svg_renderer.py exactly for visual consistency
-        colors_palette = ["#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#EF4444", "#06B6D4"]
+        colors_palette = [
+            "#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#06B6D4", "#F97316",
+            "#84CC16", "#14B8A6", "#D946EF", "#0EA5E9", "#A855F7", "#E11D48", "#6366F1", "#059669",
+            "#D97706", "#DB2777", "#2563EB", "#7C3AED", "#EA580C", "#65A30D", "#0D9488", "#C084FC",
+            "#818CF8", "#34D399", "#FBBF24", "#F472B6", "#60A5FA", "#A78BFA", "#fb923c", "#a3e635",
+            "#2dd4bf", "#38bdf8", "#1e1b4b", "#064e3b", "#78350f", "#50072b", "#1e3a8a", "#3b0764",
+            "#083344", "#431407"
+        ]
         
         prism_colors = []
         legend_items = []
@@ -290,8 +297,9 @@ class Block:
         for detail in self.prism_details:
             prism_code = getattr(detail['prism'], 'code', 'Part')
             prism_code_clean = str(prism_code).strip()
-            sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(prism_code_clean))
-            color = colors_palette[sum_chars % len(colors_palette)]
+            import zlib
+            hash_val = zlib.crc32(prism_code_clean.encode('utf-8'))
+            color = colors_palette[hash_val % len(colors_palette)]
             prism_colors.extend([color] * len(detail['coordinates']))
             
             if not only_scrap and prism_code_clean not in seen_codes:
@@ -310,7 +318,7 @@ class Block:
             y_edges=[],
             z_edges=[],
             planes={"xy_planes": [], "zx_planes": [], "yz_planes": []},
-            scrap_volumes=scrap_volumes if only_scrap else [],
+            scrap_volumes=scrap_volumes,
             prism_colors=prism_colors
         )
         

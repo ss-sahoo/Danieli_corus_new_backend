@@ -324,7 +324,14 @@ def draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edge
     fig.add_trace(prism_edges(big_block, color='#555555', width=4))
 
     # Draw prisms with different colors
-    colors = ["#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#EF4444", "#06B6D4"]
+    colors = [
+        "#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#06B6D4", "#F97316",
+        "#84CC16", "#14B8A6", "#D946EF", "#0EA5E9", "#A855F7", "#E11D48", "#6366F1", "#059669",
+        "#D97706", "#DB2777", "#2563EB", "#7C3AED", "#EA580C", "#65A30D", "#0D9488", "#C084FC",
+        "#818CF8", "#34D399", "#FBBF24", "#F472B6", "#60A5FA", "#A78BFA", "#fb923c", "#a3e635",
+        "#2dd4bf", "#38bdf8", "#1e1b4b", "#064e3b", "#78350f", "#50072b", "#1e3a8a", "#3b0764",
+        "#083344", "#431407"
+    ]
 
     for i, scrap_coordinate in enumerate(scrap_volumes):
         color = "#EF4444"  # Consistent light red color for scraps

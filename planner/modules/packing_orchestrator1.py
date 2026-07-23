@@ -113,7 +113,7 @@ class Block:
                  planes={"xy_planes":[],"zx_planes":[],"yz_planes":[],}, scrap_volumes =scrap_volumes)
         else:
             draw(big_block_coordinate, co_ordinates_list, x_edges=[], y_edges=[], z_edges=[], 
-                 planes={"xy_planes":[],"zx_planes":[],"yz_planes":[],}, scrap_volumes =[])
+                 planes={"xy_planes":[],"zx_planes":[],"yz_planes":[],}, scrap_volumes =scrap_volumes)
 
 
 

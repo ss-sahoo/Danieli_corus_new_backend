@@ -298,7 +298,14 @@ def generate_all_blocks_master_html(blocks, output_path, job_label):
 """
         
         sides = ['Front', 'Back', 'Left', 'Right', 'Top', 'Bottom']
-        colors_palette = ["#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#EF4444", "#06B6D4"]
+        colors_palette = [
+            "#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#06B6D4", "#F97316",
+            "#84CC16", "#14B8A6", "#D946EF", "#0EA5E9", "#A855F7", "#E11D48", "#6366F1", "#059669",
+            "#D97706", "#DB2777", "#2563EB", "#7C3AED", "#EA580C", "#65A30D", "#0D9488", "#C084FC",
+            "#818CF8", "#34D399", "#FBBF24", "#F472B6", "#60A5FA", "#A78BFA", "#fb923c", "#a3e635",
+            "#2dd4bf", "#38bdf8", "#1e1b4b", "#064e3b", "#78350f", "#50072b", "#1e3a8a", "#3b0764",
+            "#083344", "#431407"
+        ]
         
         for block in blocks:
             efficiency = block.get_efficiency()
@@ -313,8 +320,9 @@ def generate_all_blocks_master_html(blocks, output_path, job_label):
                     prism_code_clean = str(prism_code).strip()
                     if prism_code_clean not in seen_codes:
                         seen_codes.add(prism_code_clean)
-                        sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(prism_code_clean))
-                        color = colors_palette[sum_chars % len(colors_palette)]
+                        import zlib
+                        hash_val = zlib.crc32(prism_code_clean.encode('utf-8'))
+                        color = colors_palette[hash_val % len(colors_palette)]
                         legend_items.append((prism_code_clean, color))
             
             has_scraps = len(getattr(block, 'scraps', [])) > 0
@@ -699,6 +707,48 @@ def download_block_visualization(request, block_code):
         return Response({"success": False, "error": str(e)}, status=500)
 
 
+def ensure_up_to_date_visualizations(job_id):
+    if not job_id or not str(job_id).isdigit():
+        return
+    try:
+        from django.conf import settings
+        from .models import OptimizationHistory
+        from .modules.packing_orchestrator import Prisms, run_final_code
+        
+        history = OptimizationHistory.objects.get(id=int(job_id))
+        parts_data = history.uploaded_file_data
+        buffer_spacing = history.parameters.get('buffer_spacing', 2)
+        parent_block_sizes = history.parameters.get('parent_blocks_used', [])
+        
+        all_prisms = []
+        for part in parts_data:
+            bottom_len = part.get('Bottom Length', part.get('bottom_length', 0))
+            top_len = part.get('Top Length', part.get('top_length', 0))
+            width = part.get('Width', part.get('width', 0))
+            height = part.get('Height', part.get('height', 0))
+            mark = part.get('MARK', part.get('code', 'Part'))
+            nos = part.get('Nos', part.get('requested', 0))
+            
+            size = [bottom_len, top_len, width, height]
+            all_prisms.append(Prisms(mark, size, int(nos)))
+            
+        prism_list_sorted = sorted(all_prisms, key=lambda p: p.get_volume(), reverse=True)
+        helper = run_final_code(prism_list_sorted, buffer=buffer_spacing, parent_block_sizes=parent_block_sizes)
+        
+        html_base_dir = os.path.join(settings.MEDIA_ROOT, "block_html", str(history.id))
+        os.makedirs(html_base_dir, exist_ok=True)
+        
+        for block in helper.all_big_blocks:
+            generate_block_6_side_images(block, html_base_dir, block.unique_code)
+            
+        job_label = f"OPT-{history.id:04d}"
+        master_html_path = os.path.join(html_base_dir, f"{job_label}_All_Blocks_6_Sides.html")
+        generate_all_blocks_master_html(helper.all_big_blocks, master_html_path, job_label)
+        print(f"[REGENERATE] Successfully regenerated visualizations for job {job_id}")
+    except Exception as e:
+        print(f"[REGENERATE] Failed to regenerate: {e}")
+
+
 @api_view(['GET', 'HEAD'])
 @permission_classes([IsAuthenticated])
 def download_block_images(request, block_code):
@@ -712,6 +762,8 @@ def download_block_images(request, block_code):
         job_id = request.GET.get("job_id", "")
         if not job_id:
             return Response({"success": False, "error": "job_id parameter required"}, status=400)
+        
+        ensure_up_to_date_visualizations(job_id)
         
         # Path where HTML files are stored
         html_dir = os.path.join(settings.MEDIA_ROOT, "block_html", str(job_id))
@@ -746,6 +798,8 @@ def download_all_blocks_zip(request):
         job_id = request.GET.get("job_id", "")
         if not job_id:
             return Response({"success": False, "error": "job_id parameter required"}, status=400)
+        
+        ensure_up_to_date_visualizations(job_id)
         
         job_label = f"OPT-{str(job_id).zfill(4)}" if str(job_id).isdigit() else str(job_id)
         
@@ -794,6 +848,8 @@ def view_all_blocks(request):
         job_id = request.GET.get("job_id", "")
         if not job_id:
             return Response({"error": "job_id parameter required"}, status=400)
+        
+        ensure_up_to_date_visualizations(job_id)
         
         job_label = f"OPT-{str(job_id).zfill(4)}" if str(job_id).isdigit() else str(job_id)
         

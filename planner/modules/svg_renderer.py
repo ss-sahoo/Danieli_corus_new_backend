@@ -57,7 +57,14 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
         [3, 0, 4, 7]  # Side 4
     ]
     
-    colors = ["#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#EF4444", "#06B6D4"]
+    colors = [
+        "#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#06B6D4", "#F97316",
+        "#84CC16", "#14B8A6", "#D946EF", "#0EA5E9", "#A855F7", "#E11D48", "#6366F1", "#059669",
+        "#D97706", "#DB2777", "#2563EB", "#7C3AED", "#EA580C", "#65A30D", "#0D9488", "#C084FC",
+        "#818CF8", "#34D399", "#FBBF24", "#F472B6", "#60A5FA", "#A78BFA", "#fb923c", "#a3e635",
+        "#2dd4bf", "#38bdf8", "#1e1b4b", "#064e3b", "#78350f", "#50072b", "#1e3a8a", "#3b0764",
+        "#083344", "#431407"
+    ]
     
     def project_vertex(v):
         x_raw = v[0] - block_x_min
@@ -105,7 +112,29 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
     polygons_drawn = 0
     render_elements = []  # tuple of (depth, svg_string)
     
-    # 2. Draw placed prisms
+    # 2. Draw background scraps first (if not highlighting a specific scrap)
+    # This ensures scraps are in the background and do not wash out/overlay the prisms
+    if highlight_scrap is None:
+        for scrap in block.scraps:
+            scrap_code = getattr(scrap, 'unique_code', 'Scrap')
+            scrap_size_str = "x".join(f"{s:.0f}" for s in scrap.size) if hasattr(scrap, 'size') else ""
+            title_tooltip = f"Scrap | Size: {scrap_size_str} mm"
+            
+            for face in faces_indices:
+                pts = [project_vertex(scrap.box_coordinate[v_idx]) for v_idx in face]
+                if get_poly_area(pts) > 0.1:
+                    pts_str = " ".join(f"{pt[0]:.1f},{pt[1]:.1f}" for pt in pts)
+                    fill_col = "rgba(254, 226, 226, 0.45)"
+                    stroke_col = "#EF4444"
+                    stroke_w = "1"
+                    stroke_dash = "2,2"
+                    
+                    svg_str += f'<polygon points="{pts_str}" fill="{fill_col}" stroke="{stroke_col}" stroke-width="{stroke_w}" stroke-dasharray="{stroke_dash}">'
+                    svg_str += f'<title>{title_tooltip}</title>'
+                    svg_str += '</polygon>'
+                    polygons_drawn += 1
+
+    # 3. Draw placed prisms in the foreground
     if draw_prisms and block.prism_details:
         # Deterministic global color map by hashing the mark code
         color_map = {}
@@ -114,8 +143,9 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
             p_code = getattr(prism, 'code', getattr(prism, 'unique_code', 'Part'))
             p_code_clean = str(p_code).strip()
             if p_code_clean not in color_map:
-                sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(p_code_clean))
-                color_map[p_code_clean] = colors[sum_chars % len(colors)]
+                import zlib
+                hash_val = zlib.crc32(p_code_clean.encode('utf-8'))
+                color_map[p_code_clean] = colors[hash_val % len(colors)]
         
         prism_idx = 0
         for detail in block.prism_details:
@@ -170,8 +200,8 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
         render_elements.sort(key=lambda x: x[0], reverse=True)
         for _, svg_element in render_elements:
             svg_str += svg_element
-            
-    # 3. Draw scraps (only if a specific scrap is being highlighted, to match 3D behavior)
+
+    # 4. Draw highlighted scrap on top of everything (if we are explicitly highlighting one)
     if highlight_scrap is not None:
         for scrap in block.scraps:
             if getattr(scrap, 'unique_code', '') != getattr(highlight_scrap, 'unique_code', ''):
@@ -179,28 +209,20 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
                 
             scrap_code = getattr(scrap, 'unique_code', 'Scrap')
             scrap_size_str = "x".join(f"{s:.0f}" for s in scrap.size) if hasattr(scrap, 'size') else ""
-        title_tooltip = f"Scrap | Size: {scrap_size_str} mm"
-        
-        for face in faces_indices:
-            pts = [project_vertex(scrap.box_coordinate[v_idx]) for v_idx in face]
-            if get_poly_area(pts) > 0.1:
-                pts_str = " ".join(f"{pt[0]:.1f},{pt[1]:.1f}" for pt in pts)
-                
-                if highlight_scrap is not None:
+            title_tooltip = f"Scrap | Size: {scrap_size_str} mm"
+            
+            for face in faces_indices:
+                pts = [project_vertex(scrap.box_coordinate[v_idx]) for v_idx in face]
+                if get_poly_area(pts) > 0.1:
+                    pts_str = " ".join(f"{pt[0]:.1f},{pt[1]:.1f}" for pt in pts)
                     fill_col = "rgba(239, 68, 68, 0.35)"
                     stroke_col = "#EF4444"
                     stroke_w = "2"
-                    stroke_dash = "none"
-                else:
-                    fill_col = "rgba(254, 226, 226, 0.5)"
-                    stroke_col = "#EF4444"
-                    stroke_w = "1"
-                    stroke_dash = "2,2"
                     
-                svg_str += f'<polygon points="{pts_str}" fill="{fill_col}" stroke="{stroke_col}" stroke-width="{stroke_w}" stroke-dasharray="{stroke_dash}">'
-                svg_str += f'<title>{title_tooltip}</title>'
-                svg_str += '</polygon>'
-                polygons_drawn += 1
+                    svg_str += f'<polygon points="{pts_str}" fill="{fill_col}" stroke="{stroke_col}" stroke-width="{stroke_w}">'
+                    svg_str += f'<title>{title_tooltip}</title>'
+                    svg_str += '</polygon>'
+                    polygons_drawn += 1
                 
     # Check if empty
     if polygons_drawn == 0:
@@ -224,7 +246,14 @@ def get_block_svg_html(block, block_code):
     sides = ['Front', 'Back', 'Left', 'Right', 'Top', 'Bottom']
     svgs = {side: generate_svg_for_block_side(block, side) for side in sides}
     
-    colors_palette = ["#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#EF4444", "#06B6D4"]
+    colors_palette = [
+        "#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#06B6D4", "#F97316",
+        "#84CC16", "#14B8A6", "#D946EF", "#0EA5E9", "#A855F7", "#E11D48", "#6366F1", "#059669",
+        "#D97706", "#DB2777", "#2563EB", "#7C3AED", "#EA580C", "#65A30D", "#0D9488", "#C084FC",
+        "#818CF8", "#34D399", "#FBBF24", "#F472B6", "#60A5FA", "#A78BFA", "#fb923c", "#a3e635",
+        "#2dd4bf", "#38bdf8", "#1e1b4b", "#064e3b", "#78350f", "#50072b", "#1e3a8a", "#3b0764",
+        "#083344", "#431407"
+    ]
     legend_items = []
     seen_codes = set()
     if block.prism_details:
@@ -233,8 +262,9 @@ def get_block_svg_html(block, block_code):
             prism_code_clean = str(prism_code).strip()
             if prism_code_clean not in seen_codes:
                 seen_codes.add(prism_code_clean)
-                sum_chars = sum((i + 1) * ord(c) for i, c in enumerate(prism_code_clean))
-                color = colors_palette[sum_chars % len(colors_palette)]
+                import zlib
+                hash_val = zlib.crc32(prism_code_clean.encode('utf-8'))
+                color = colors_palette[hash_val % len(colors_palette)]
                 legend_items.append((prism_code_clean, color))
                 
     has_scraps = len(block.scraps) > 0
