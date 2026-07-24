@@ -722,30 +722,12 @@ def ensure_up_to_date_visualizations(job_id):
             print(f"[REGENERATE] Job {job_id} already generated and files exist, skipping.")
             return
             
-        from .models import OptimizationHistory
-        from .modules.packing_orchestrator import Prisms, run_final_code
-        
-        history = OptimizationHistory.objects.get(id=int(job_id))
-        parts_data = history.uploaded_file_data
-        buffer_spacing = history.parameters.get('buffer_spacing', 2)
-        parent_block_sizes = history.parameters.get('parent_blocks_used', [])
-        
-        all_prisms = []
-        for part in parts_data:
-            bottom_len = part.get('Bottom Length', part.get('bottom_length', 0))
-            top_len = part.get('Top Length', part.get('top_length', 0))
-            width = part.get('Width', part.get('width', 0))
-            height = part.get('Height', part.get('height', 0))
-            mark = part.get('MARK', part.get('code', 'Part'))
-            nos = part.get('Nos', part.get('requested', 0))
+        helper = get_helper_for_job(job_id, cache)
+        if helper is None:
+            print(f"[REGENERATE] Failed to retrieve helper for job {job_id}")
+            return
             
-            size = [bottom_len, top_len, width, height]
-            all_prisms.append(Prisms(mark, size, int(nos)))
-            
-        prism_list_sorted = sorted(all_prisms, key=lambda p: p.get_volume(), reverse=True)
-        helper = run_final_code(prism_list_sorted, buffer=buffer_spacing, parent_block_sizes=parent_block_sizes)
-        
-        html_base_dir = os.path.join(settings.MEDIA_ROOT, "block_html", str(history.id))
+        html_base_dir = os.path.join(settings.MEDIA_ROOT, "block_html", str(job_id))
         os.makedirs(html_base_dir, exist_ok=True)
         
         for block in helper.all_big_blocks:
@@ -888,6 +870,21 @@ def get_helper_for_job(job_id, cache):
     cached_helper = django_cache.get(helper_cache_key)
     if cached_helper is not None:
         return cached_helper
+
+    # Try loading from pickled helper on disk first for perfect fidelity
+    try:
+        import pickle
+        import os
+        from django.conf import settings
+        pkl_path = os.path.join(settings.MEDIA_ROOT, "helpers", f"{job_id}.pkl")
+        if os.path.exists(pkl_path):
+            with open(pkl_path, "rb") as f:
+                helper = pickle.load(f)
+            django_cache.set(helper_cache_key, helper, timeout=1800)
+            print(f"[GET_HELPER] Successfully loaded pickled helper from disk for job_id={job_id}")
+            return helper
+    except Exception as e:
+        print(f"[GET_HELPER] Failed to load pickled helper for job {job_id}: {e}")
 
     try:
         from .models import OptimizationHistory
@@ -1669,6 +1666,18 @@ def upload_and_optimize(request):
                 history.job_name = f"OPT-{history.id:04d} \u00b7 {clean_stem} \u00b7 {date_tag}"
                 history.save(update_fields=['job_name'])
                 
+                # Save pickled helper to disk for perfect fidelity dynamic requests
+                try:
+                    import pickle
+                    helpers_dir = os.path.join(settings.MEDIA_ROOT, "helpers")
+                    os.makedirs(helpers_dir, exist_ok=True)
+                    pkl_path = os.path.join(helpers_dir, f"{history.id}.pkl")
+                    with open(pkl_path, "wb") as f:
+                        pickle.dump(helper, f)
+                    print(f"✓ Saved pickled helper for job {history.id} to {pkl_path}")
+                except Exception as pkl_err:
+                    print(f"⚠ Failed to save pickled helper: {pkl_err}")
+
                 history_id = history.id
                 history_saved = True
                 print(f"[HISTORY] Saved optimization #{history.id} for user {request.user.username}")
