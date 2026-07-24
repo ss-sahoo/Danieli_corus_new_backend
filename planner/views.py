@@ -879,6 +879,46 @@ def view_all_blocks(request):
         return Response({"error": str(e)}, status=500)
 
 
+def get_helper_for_job(job_id, cache):
+    if not job_id:
+        return cache.get("latest_helper")
+        
+    from django.core.cache import cache as django_cache
+    helper_cache_key = f"helper_objs_{job_id}"
+    cached_helper = django_cache.get(helper_cache_key)
+    if cached_helper is not None:
+        return cached_helper
+
+    try:
+        from .models import OptimizationHistory
+        from .modules.packing_orchestrator import Prisms, run_final_code
+        history = OptimizationHistory.objects.get(id=int(job_id))
+        parts_data = history.uploaded_file_data
+        buffer_spacing = history.parameters.get('buffer_spacing', 2)
+        parent_block_sizes = history.parameters.get('parent_blocks_used', [])
+        
+        all_prisms = []
+        for part in parts_data:
+            bottom_len = part.get('Bottom Length', part.get('bottom_length', 0))
+            top_len = part.get('Top Length', part.get('top_length', 0))
+            width = part.get('Width', part.get('width', 0))
+            height = part.get('Height', part.get('height', 0))
+            mark = part.get('MARK', part.get('code', 'Part'))
+            nos = part.get('Nos', part.get('requested', 0))
+            
+            size = [bottom_len, top_len, width, height]
+            all_prisms.append(Prisms(mark, size, int(nos)))
+            
+        prism_list_sorted = sorted(all_prisms, key=lambda p: p.get_volume(), reverse=True)
+        helper = run_final_code(prism_list_sorted, buffer=buffer_spacing, parent_block_sizes=parent_block_sizes)
+        
+        django_cache.set(helper_cache_key, helper, timeout=1800)
+        return helper
+    except Exception as e:
+        print(f"[GET_HELPER] Error reconstructing helper for job {job_id}: {e}")
+        return cache.get("latest_helper")
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def generate_block_visualization(request, block_code):
@@ -887,7 +927,8 @@ def generate_block_visualization(request, block_code):
         from django.core.cache import cache
         import os
         
-        helper = cache.get("latest_helper")
+        job_id = request.data.get('job_id') or request.GET.get('job_id') or request.query_params.get('job_id')
+        helper = get_helper_for_job(job_id, cache)
         if helper is None:
             return Response({
                 "success": False,
@@ -963,13 +1004,8 @@ def generate_scrap_visualization(request, scrap_code):
         from datetime import datetime
         import os, time
 
-        helper = None
-        for _ in range(20):
-            helper = cache.get("latest_helper")
-            if helper is not None:
-                break
-            time.sleep(0.2)
-
+        job_id = request.data.get('job_id') or request.GET.get('job_id') or request.query_params.get('job_id')
+        helper = get_helper_for_job(job_id, cache)
         if helper is None:
             return Response({
                 "success": False,
