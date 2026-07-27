@@ -1078,7 +1078,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                 result = random.sample(item, 1)
                 #result = ['choice2']
                 if 'choice1' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, more_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
@@ -1087,7 +1087,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
                 elif 'choice2' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, moderate_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
@@ -1111,7 +1111,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                 result = random.sample(item, 1)
                 #result = ['choice2']
                 if 'choice1' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, more_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
@@ -1120,7 +1120,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
                 elif 'choice2' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, moderate_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
@@ -1157,7 +1157,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                 result = random.sample(item, 1)
                 #result = ['choice2']
                 if 'choice1' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, more_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
@@ -1166,7 +1166,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
                 elif 'choice2' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, moderate_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
@@ -1189,7 +1189,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                 result = random.sample(item, 1)
                 #result = ['choice2']
                 if 'choice1' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, more_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
@@ -1198,7 +1198,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
                 elif 'choice2' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, moderate_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
@@ -1271,7 +1271,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                 result = random.sample(item, 1)
                 #result = ['choice2']
                 if 'choice1' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, more_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
@@ -1280,7 +1280,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
                 elif 'choice2' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, moderate_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
@@ -1302,7 +1302,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                 result = random.sample(item, 1)
                 #result = ['choice2']
                 if 'choice1' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, more_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
@@ -1311,7 +1311,7 @@ def get_scrap_volume_of_type4(Block_size, edges, st_co= [0,0,0]):
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 
                 elif 'choice2' in result:
-                    x_in, y_in, z_in          = less_x, less_z, less_z
+                    x_in, y_in, z_in          = less_x, less_y, less_z
                     x_final, y_final, z_final = more_x, moderate_y, more_z
                     scrap_Boxes.append({'starting_co': [x_in,y_in,z_in],'Box_size':[x_final - x_in, y_final -y_in, z_final -z_in] })
 

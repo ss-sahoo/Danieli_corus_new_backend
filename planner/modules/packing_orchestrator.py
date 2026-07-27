@@ -12,6 +12,20 @@ from typing import List, Dict, Tuple, Optional, Any
 # Import from fill module (ensure this exists in your project)
 from .fill import fill_the_box, draw, get_scrap_vol
 
+# Tolerance for treating two solids as touching rather than overlapping (mm).
+OVERLAP_TOL = 1e-4
+
+
+def aabb(points) -> Tuple[np.ndarray, np.ndarray]:
+    """Axis-aligned bounding box of a list of 3D points, as (min_corner, max_corner)."""
+    arr = np.asarray(points, dtype=float)
+    return arr.min(axis=0), arr.max(axis=0)
+
+
+def boxes_overlap(lo_a, hi_a, lo_b, hi_b, tol: float = OVERLAP_TOL) -> bool:
+    """True if two axis-aligned boxes share interior volume (touching faces do not count)."""
+    return bool((np.minimum(hi_a, hi_b) - np.maximum(lo_a, lo_b)).min() > tol)
+
 
 class Prisms:
     """Represents a trapezoidal prism with dimensions and quantity"""
@@ -211,7 +225,20 @@ class Block:
         prism_detail = {'prism': prism, 'coordinates': coordinates}
         self.prism_details.append(prism_detail)
         self.all_prisms_coordinates.extend(coordinates)
-    
+
+    def occupied_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Bounding boxes of every prism placed in this block.
+
+        Returns:
+            (mins, maxs) as (N, 3) arrays; both are empty when nothing is placed yet.
+        """
+        if not self.all_prisms_coordinates:
+            return np.empty((0, 3)), np.empty((0, 3))
+
+        arr = np.asarray(self.all_prisms_coordinates, dtype=float)
+        return arr.min(axis=1), arr.max(axis=1)
+
     def get_efficiency(self) -> float:
         """Calculate packing efficiency as percentage"""
         prism_volume = 0
@@ -529,7 +556,8 @@ class People_helper:
         self.buffer = buffer
         self.parent_block_sizes = parent_block_sizes or [[1870, 800, 350]]
         self.all_scrap_temp = []
-    
+        self.rejected_scrap_count = 0  # scrap boxes discarded as unsound, see add_update_scrap_list
+
     def add_one_big_block(self, size: List[float], code: str = 'B') -> Block:
         """Create a new stock block"""
         self.big_block_count += 1
@@ -707,8 +735,10 @@ class People_helper:
             block = scrap.parent_block
             prism.update_prism_left(prism_count)
             block.add_prisms_coordinates(prism, co_ordinates_list)
-            scrap_blocks_list_temp = self.add_update_scrap_list(block, scrap_volumes)
+            # Retire the consumed scrap first: the new scraps are its leftover sub-regions
+            # and lie inside it, so they would fail the overlap check while it is still listed.
             self.delete_scrap(scrap)
+            scrap_blocks_list_temp = self.add_update_scrap_list(block, scrap_volumes)
         else:
             raise Exception('scrap must be Block or Scrap instance')
         
@@ -722,25 +752,47 @@ class People_helper:
         return is_small_volume or is_small_length
     
     def add_update_scrap_list(self, block: Block, scrap_volumes: List) -> List[Scrap]:
-        """Add new scrap pieces to the scrap list"""
+        """
+        Add new scrap pieces to the scrap list.
+
+        A scrap means "free space inside this block", and later passes pack prisms into
+        it. get_scrap_vol picks its cutting planes with random.sample and is not
+        guaranteed sound, so a small fraction of the boxes it returns cover space that
+        already holds a prism. Registering one of those would let the next pass pack a
+        part inside solid material, so candidates are checked before being accepted.
+        """
         scrap_blocks_list_temp = []
-        
+        occ_lo, occ_hi = block.occupied_bounds()
+        existing = [aabb(s.box_coordinate) for s in block.scraps]
+
         for scrap_vol in scrap_volumes:
             self.scrap_count += 1
             rot = Rotation()
             scrap_starting_point, scrap_size = rot.get_starting_co_and_size(scrap_vol, after_rotation=False)
-            
+
             if self.is_small_size(scrap_size):
                 continue
-            
+
+            lo = np.asarray(scrap_starting_point, dtype=float)
+            hi = lo + np.asarray(scrap_size, dtype=float)
+
+            if len(occ_lo) and (np.minimum(occ_hi, hi) - np.maximum(occ_lo, lo)).min(axis=1).max() > OVERLAP_TOL:
+                self.rejected_scrap_count += 1
+                continue
+
+            if any(boxes_overlap(lo, hi, e_lo, e_hi) for e_lo, e_hi in existing):
+                self.rejected_scrap_count += 1
+                continue
+
             s = Scrap('s' + str(self.scrap_count), scrap_size, scrap_starting_point)
             block.add_scrap(s)
+            existing.append((lo, hi))
             scrap_blocks_list_temp.append(s)
-        
+
         # Sort by volume (smallest first)
         scrap_blocks_list_temp = sorted(scrap_blocks_list_temp, key=lambda s: s.volume)
         self.all_scrap.extend(scrap_blocks_list_temp)
-        
+
         return scrap_blocks_list_temp
     
     def delete_scrap(self, scrap: Scrap):
@@ -748,6 +800,101 @@ class People_helper:
         if scrap in self.all_scrap:
             self.all_scrap.remove(scrap)
         scrap.delete_scrap()
+
+
+# Vertex order produced by place_prism_flip: 0-3 bottom face, 4-7 top face.
+_PRISM_FACES = [(0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
+_PRISM_EDGES = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+                (0, 4), (1, 5), (2, 6), (3, 7)]
+
+
+def _separating_axes(solid: np.ndarray) -> List[np.ndarray]:
+    """Face normals of one trapezoidal prism, normalised."""
+    out = []
+    for a, b, c, _ in _PRISM_FACES:
+        n = np.cross(solid[b] - solid[a], solid[c] - solid[a])
+        norm = np.linalg.norm(n)
+        if norm > 1e-9:
+            out.append(n / norm)
+    return out
+
+
+def solids_overlap(solid_a: List, solid_b: List, tol: float = OVERLAP_TOL) -> float:
+    """
+    Interpenetration depth of two trapezoidal prisms, via the separating axis theorem.
+
+    Bounding boxes are not usable here: the packer deliberately interlocks alternating
+    tapered prisms, so neighbours share bounding-box volume while the solids themselves
+    only touch. Both are convex, so SAT over face normals plus pairwise edge cross
+    products is exact.
+
+    Returns:
+        Depth in mm along the least-overlapping axis, or 0.0 if a separating axis exists.
+    """
+    a = np.asarray(solid_a, dtype=float)
+    b = np.asarray(solid_b, dtype=float)
+
+    axes = _separating_axes(a) + _separating_axes(b)
+    edges_a = [a[j] - a[i] for i, j in _PRISM_EDGES]
+    edges_b = [b[j] - b[i] for i, j in _PRISM_EDGES]
+    for ea in edges_a:
+        for eb in edges_b:
+            axis = np.cross(ea, eb)
+            norm = np.linalg.norm(axis)
+            if norm > 1e-9:
+                axes.append(axis / norm)
+
+    depth = float('inf')
+    for axis in axes:
+        pa = a @ axis
+        pb = b @ axis
+        gap = min(pa.max(), pb.max()) - max(pa.min(), pb.min())
+        if gap <= tol:
+            return 0.0
+        depth = min(depth, gap)
+
+    return depth
+
+
+def find_overlaps(helper: People_helper, tol: float = OVERLAP_TOL) -> List[Dict[str, Any]]:
+    """
+    Check the invariant that no two prisms occupy the same space.
+
+    This should always come back empty. A non-empty result means the packing is not
+    manufacturable and must not be handed to the caller.
+
+    Returns:
+        One entry per offending pair: block code, the two prism codes, and how deep
+        they interpenetrate in mm.
+    """
+    problems = []
+
+    for block in helper.all_big_blocks:
+        labels = []
+        for entry in block.prism_details:
+            code = entry['prism'].code
+            labels.extend([code] * len(entry['coordinates']))
+
+        lo, hi = block.occupied_bounds()
+        if len(lo) < 2:
+            continue
+
+        # Cheap bounding-box pass to shortlist candidates, then an exact test on those.
+        overlap = np.minimum(hi[:, None, :], hi[None, :, :]) - np.maximum(lo[:, None, :], lo[None, :, :])
+        candidates = overlap.min(axis=2) > tol
+        rows, cols = np.triu_indices(len(lo), k=1)
+        for i, j in zip(rows[candidates[rows, cols]], cols[candidates[rows, cols]]):
+            depth = solids_overlap(block.all_prisms_coordinates[i],
+                                   block.all_prisms_coordinates[j], tol)
+            if depth > tol:
+                problems.append({
+                    'block': block.unique_code,
+                    'prism_a': labels[i],
+                    'prism_b': labels[j],
+                    'penetration_mm': round(depth, 3)
+                })
+
+    return problems
 
 
 def get_block_details(helper: People_helper) -> Dict[str, Any]:
@@ -938,7 +1085,13 @@ def run_optimization_with_retries(excel_path: str, parent_block_sizes: List[List
                 # Check if any block has >= 99% efficiency (too good to be true)
                 has_perfect_block = any(obj['eff'] >= 99 for obj in block_details['blocks'])
 
-                if not has_perfect_block:
+                # Never return a packing where prisms interpenetrate - it cannot be cut.
+                overlaps = find_overlaps(helper)
+                if overlaps:
+                    print(f"Attempt {tried}: rejected, {len(overlaps)} overlapping prism pairs "
+                          f"(e.g. {overlaps[0]})")
+
+                if not has_perfect_block and not overlaps:
                     return helper, block_details
 
             tried += 1
