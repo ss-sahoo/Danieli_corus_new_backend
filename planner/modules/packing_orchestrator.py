@@ -16,6 +16,103 @@ from .fill import fill_the_box, draw, get_scrap_vol
 OVERLAP_TOL = 1e-4
 
 
+def get_prism_color_mapping(block):
+    """
+    Generate a deterministic, collision-free color mapping and legend items for a block.
+    
+    Returns:
+        color_map: dict mapping prism_code -> color
+        legend_items: list of (legend_label, color, is_scrap)
+        label_map: dict mapping prism_code -> label (which is just the prism_code)
+    """
+    colors_palette = [
+        "#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#06B6D4", "#F97316",
+        "#84CC16", "#14B8A6", "#D946EF", "#0EA5E9", "#A855F7", "#E11D48", "#6366F1", "#059669",
+        "#D97706", "#DB2777", "#2563EB", "#7C3AED", "#EA580C", "#65A30D", "#0D9488", "#C084FC",
+        "#818CF8", "#34D399", "#FBBF24", "#F472B6", "#60A5FA", "#A78BFA", "#fb923c", "#a3e635",
+        "#2dd4bf", "#38bdf8", "#1e1b4b", "#064e3b", "#78350f", "#50072b", "#1e3a8a", "#3b0764",
+        "#083344", "#431407"
+    ]
+    
+    # 1. Gather all unique part codes in a deterministic order
+    # If parent_helper is present, we loop through all blocks in the job to number globally.
+    helper = getattr(block, 'parent_helper', None)
+    unique_codes = set()
+    
+    if helper and getattr(helper, 'all_big_blocks', None):
+        for b in helper.all_big_blocks:
+            if getattr(b, 'prism_details', None):
+                for detail in b.prism_details:
+                    p_code = getattr(detail['prism'], 'code', 'Part')
+                    unique_codes.add(str(p_code).strip())
+    else:
+        if getattr(block, 'prism_details', None):
+            for detail in block.prism_details:
+                p_code = getattr(detail['prism'], 'code', 'Part')
+                unique_codes.add(str(p_code).strip())
+                
+    # Sort the part codes deterministically to make color assignment stable
+    def code_sort_key(code):
+        try:
+            import re
+            numeric_part = int(re.search(r'\d+', code).group())
+        except:
+            numeric_part = 999999
+        return (numeric_part, code)
+        
+    sorted_codes = sorted(list(unique_codes), key=code_sort_key)
+    
+    # 2. Assign unique color from palette to each part code
+    import colorsys
+    import random
+    
+    n_needed = len(sorted_codes)
+    assigned_colors = list(colors_palette)
+    
+    # If we need more than our base premium palette, dynamically generate distinct ones using HSL Golden Ratio spacing
+    if n_needed > len(colors_palette):
+        h = 0.0
+        golden_ratio_conjugate = 0.618033988749895
+        while len(assigned_colors) < n_needed:
+            h = (h + golden_ratio_conjugate) % 1.0
+            l = 0.55 if len(assigned_colors) % 2 == 0 else 0.40
+            s = 0.75
+            r, g, b_val = colorsys.hls_to_rgb(h, l, s)
+            hex_color = f"#{int(r*255):02X}{int(g*255):02X}{int(b_val*255):02X}"
+            if hex_color not in assigned_colors:
+                assigned_colors.append(hex_color)
+                
+    # Deterministically shuffle the codes using a fixed seed (101) so that
+    # alphabetically-consecutive codes (like T35A vs T39B) do not end up
+    # with adjacent and similar colors from the palette.
+    shuffled_codes = list(sorted_codes)
+    random.Random(101).shuffle(shuffled_codes)
+    
+    color_map = {}
+    label_map = {}
+    for i, code in enumerate(shuffled_codes):
+        color_map[code] = assigned_colors[i]
+        label_map[code] = code
+        
+    # 3. Generate legend items for this block (only for part codes actually present in this block)
+    block_legend_items = []
+    seen_codes = set()
+    
+    if getattr(block, 'prism_details', None):
+        for detail in block.prism_details:
+            p_code = getattr(detail['prism'], 'code', 'Part')
+            p_code_clean = str(p_code).strip()
+            if p_code_clean not in seen_codes:
+                seen_codes.add(p_code_clean)
+                
+    # Keep legend ordered by sorted_codes
+    for code in sorted_codes:
+        if code in seen_codes:
+            block_legend_items.append((code, color_map[code], False))
+            
+    return color_map, block_legend_items, label_map
+
+
 def aabb(points) -> Tuple[np.ndarray, np.ndarray]:
     """Axis-aligned bounding box of a list of 3D points, as (min_corner, max_corner)."""
     arr = np.asarray(points, dtype=float)
@@ -308,30 +405,19 @@ class Block:
         co_ordinates_list = self.all_prisms_coordinates
         scrap_volumes = [s.box_coordinate for s in self.scraps]
         
-        # Color mapping logic matching svg_renderer.py exactly for visual consistency
-        colors_palette = [
-            "#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#06B6D4", "#F97316",
-            "#84CC16", "#14B8A6", "#D946EF", "#0EA5E9", "#A855F7", "#E11D48", "#6366F1", "#059669",
-            "#D97706", "#DB2777", "#2563EB", "#7C3AED", "#EA580C", "#65A30D", "#0D9488", "#C084FC",
-            "#818CF8", "#34D399", "#FBBF24", "#F472B6", "#60A5FA", "#A78BFA", "#fb923c", "#a3e635",
-            "#2dd4bf", "#38bdf8", "#1e1b4b", "#064e3b", "#78350f", "#50072b", "#1e3a8a", "#3b0764",
-            "#083344", "#431407"
-        ]
+        # Get consistent, collision-free color mapping for the job/block
+        color_map, block_legend_items, legend_map = get_prism_color_mapping(self)
         
         prism_colors = []
-        legend_items = []
-        seen_codes = set()
         for detail in self.prism_details:
             prism_code = getattr(detail['prism'], 'code', 'Part')
             prism_code_clean = str(prism_code).strip()
-            import zlib
-            hash_val = zlib.crc32(prism_code_clean.encode('utf-8'))
-            color = colors_palette[hash_val % len(colors_palette)]
+            color = color_map.get(prism_code_clean, "#4F46E5")
             prism_colors.extend([color] * len(detail['coordinates']))
-            
-            if not only_scrap and prism_code_clean not in seen_codes:
-                seen_codes.add(prism_code_clean)
-                legend_items.append((prism_code_clean, color, False))
+        
+        legend_items = []
+        if not only_scrap:
+            legend_items.extend(block_legend_items)
                 
         if only_scrap:
             legend_items.append(("Selected Scrap", "rgba(239, 68, 68, 0.5)", True))

@@ -1,5 +1,6 @@
 import os
 import math
+import numpy as np
 from datetime import datetime
 
 def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_prisms=True):
@@ -136,16 +137,8 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
 
     # 3. Draw placed prisms in the foreground
     if draw_prisms and block.prism_details:
-        # Deterministic global color map by hashing the mark code
-        color_map = {}
-        for detail in block.prism_details:
-            prism = detail['prism']
-            p_code = getattr(prism, 'code', getattr(prism, 'unique_code', 'Part'))
-            p_code_clean = str(p_code).strip()
-            if p_code_clean not in color_map:
-                import zlib
-                hash_val = zlib.crc32(p_code_clean.encode('utf-8'))
-                color_map[p_code_clean] = colors[hash_val % len(colors)]
+        from .packing_orchestrator import get_prism_color_mapping
+        color_map, _, legend_map = get_prism_color_mapping(block)
         
         prism_idx = 0
         for detail in block.prism_details:
@@ -153,10 +146,11 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
             p_code = getattr(prism, 'code', getattr(prism, 'unique_code', 'Part'))
             p_code_clean = str(p_code).strip()
             p_size_str = "x".join(f"{s:.0f}" for s in prism.size) if hasattr(prism, 'size') else ""
-            title_tooltip = f"Part: {p_code_clean} | Size: {p_size_str} mm"
-            color = color_map.get(p_code_clean, "#4F46E5")
             
             for coords in detail['coordinates']:
+                color = color_map.get(p_code_clean, "#4F46E5")
+                title_tooltip = f"Part: {p_code_clean} | Size: {p_size_str} mm"
+                
                 for face in faces_indices:
                     pts = [project_vertex(coords[v_idx]) for v_idx in face]
                     if get_poly_area(pts) > 0.1:
@@ -254,18 +248,13 @@ def get_block_svg_html(block, block_code):
         "#2dd4bf", "#38bdf8", "#1e1b4b", "#064e3b", "#78350f", "#50072b", "#1e3a8a", "#3b0764",
         "#083344", "#431407"
     ]
+    # Get consistent, collision-free global color mapping for the job/block
+    from .packing_orchestrator import get_prism_color_mapping
+    color_map, block_legend_items, legend_map = get_prism_color_mapping(block)
+
     legend_items = []
-    seen_codes = set()
-    if block.prism_details:
-        for detail in block.prism_details:
-            prism_code = getattr(detail['prism'], 'code', 'Part')
-            prism_code_clean = str(prism_code).strip()
-            if prism_code_clean not in seen_codes:
-                seen_codes.add(prism_code_clean)
-                import zlib
-                hash_val = zlib.crc32(prism_code_clean.encode('utf-8'))
-                color = colors_palette[hash_val % len(colors_palette)]
-                legend_items.append((prism_code_clean, color))
+    for label, col, _ in block_legend_items:
+        legend_items.append((label, col))
                 
     has_scraps = len(block.scraps) > 0
     legend_html = ""
@@ -767,13 +756,8 @@ def get_block_svg_3d_html(block, block_code, highlight_scrap=None, only_scrap=Fa
             return f"#{hex_color}"
 
     # 1. ADD PARTS FACES
-    colors = ["#4F46E5", "#10B981", "#F59E0B", "#EC4899", "#3B82F6", "#8B5CF6", "#EF4444", "#06B6D4"]
-    
-    # Gather colors per prism type
-    unique_codes = []
-    if block.prism_details:
-        unique_codes = sorted(list(set(getattr(p_detail['prism'], 'code', 'Part') for p_detail in block.prism_details)))
-    color_map = {code: colors[idx % len(colors)] for idx, code in enumerate(unique_codes)}
+    from .packing_orchestrator import get_prism_color_mapping
+    color_map, block_legend_items, legend_map = get_prism_color_mapping(block)
     
     # Opacity settings
     has_highlight = highlight_scrap is not None
@@ -783,21 +767,23 @@ def get_block_svg_3d_html(block, block_code, highlight_scrap=None, only_scrap=Fa
         for detail in block.prism_details:
             prism = detail['prism']
             p_code = getattr(prism, 'code', 'Part')
+            p_code_clean = str(p_code).strip()
             p_size_str = "x".join(f"{s:.0f}" for s in prism.size) if hasattr(prism, 'size') else ""
-            title_tooltip = f"Part: {p_code} | Size: {p_size_str} mm"
-            base_color = color_map.get(p_code, "#4F46E5")
-            
-            # Shaded colors for faces
-            shaded_colors = {
-                1: shade_color(base_color, 0.75),  # Side 1 (Front-Left)
-                2: shade_color(base_color, 0.88),  # Side 2 (Front-Right)
-                3: shade_color(base_color, 0.88),  # Side 3
-                4: shade_color(base_color, 0.75),  # Side 4
-                0: shade_color(base_color, 0.65),  # Bottom
-                5: base_color                      # Top (Top faces unshaded)
-            }
             
             for coords in detail['coordinates']:
+                base_color = color_map.get(p_code_clean, "#4F46E5")
+                title_tooltip = f"Part: {p_code_clean} | Size: {p_size_str} mm"
+                
+                # Shaded colors for faces
+                shaded_colors = {
+                    1: shade_color(base_color, 0.75),  # Side 1 (Front-Left)
+                    2: shade_color(base_color, 0.88),  # Side 2 (Front-Right)
+                    3: shade_color(base_color, 0.88),  # Side 3
+                    4: shade_color(base_color, 0.75),  # Side 4
+                    0: shade_color(base_color, 0.65),  # Bottom
+                    5: base_color                      # Top (Top faces unshaded)
+                }
+                
                 # Draw visible faces: Top face (5), Side 1 (2), Side 2 (3) (Wait, map face_idx from faces_indices list mapping above)
                 # Bottom (0), Top (1), Side 1 (2), Side 2 (3), Side 3 (4), Side 4 (5)
                 # Let's render visible faces: Top (1), Side 1 (2), Side 2 (3) page-facing
@@ -935,11 +921,10 @@ def get_block_svg_3d_html(block, block_code, highlight_scrap=None, only_scrap=Fa
     volume = block.volume
     
     legend_html = ""
-    if not only_scrap and unique_codes:
+    if not only_scrap and block_legend_items:
         legend_html += '<div class="legend-container">'
-        for code in unique_codes:
-            col = color_map.get(code, "#4F46E5")
-            legend_html += f'<div class="legend-item"><span class="legend-color" style="background-color: {col};"></span><span class="legend-text">{code}</span></div>'
+        for unique_id, col, _ in block_legend_items:
+            legend_html += f'<div class="legend-item"><span class="legend-color" style="background-color: {col};"></span><span class="legend-text">{unique_id}</span></div>'
         legend_html += '<div class="legend-item"><span class="legend-color" style="background-color: rgba(239, 68, 68, 0.45); border: 1px dashed #EF4444;"></span><span class="legend-text">Scrap</span></div>'
         legend_html += '</div>'
     elif only_scrap:

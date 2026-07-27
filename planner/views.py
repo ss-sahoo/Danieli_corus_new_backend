@@ -307,23 +307,19 @@ def generate_all_blocks_master_html(blocks, output_path, job_label):
             "#083344", "#431407"
         ]
         
+        from .modules.packing_orchestrator import get_prism_color_mapping
+        
         for block in blocks:
             efficiency = block.get_efficiency()
             size = block.size
             volume = block.volume
             
+            # Retrieve color mapping and legend items for the current block
+            color_map, block_legend_items, legend_map = get_prism_color_mapping(block)
+            
             legend_items = []
-            seen_codes = set()
-            if getattr(block, 'prism_details', None):
-                for detail in block.prism_details:
-                    prism_code = getattr(detail['prism'], 'code', 'Part')
-                    prism_code_clean = str(prism_code).strip()
-                    if prism_code_clean not in seen_codes:
-                        seen_codes.add(prism_code_clean)
-                        import zlib
-                        hash_val = zlib.crc32(prism_code_clean.encode('utf-8'))
-                        color = colors_palette[hash_val % len(colors_palette)]
-                        legend_items.append((prism_code_clean, color))
+            for label, col, _ in block_legend_items:
+                legend_items.append((label, col))
             
             has_scraps = len(getattr(block, 'scraps', [])) > 0
             legend_html = ""
@@ -862,58 +858,63 @@ def view_all_blocks(request):
 
 
 def get_helper_for_job(job_id, cache):
+    helper = None
     if not job_id:
-        return cache.get("latest_helper")
-        
-    from django.core.cache import cache as django_cache
-    helper_cache_key = f"helper_objs_{job_id}"
-    cached_helper = django_cache.get(helper_cache_key)
-    if cached_helper is not None:
-        return cached_helper
+        helper = cache.get("latest_helper")
+    else:
+        from django.core.cache import cache as django_cache
+        helper_cache_key = f"helper_objs_{job_id}"
+        cached_helper = django_cache.get(helper_cache_key)
+        if cached_helper is not None:
+            helper = cached_helper
+        else:
+            # Try loading from pickled helper on disk first for perfect fidelity
+            try:
+                import pickle
+                import os
+                from django.conf import settings
+                pkl_path = os.path.join(settings.MEDIA_ROOT, "helpers", f"{job_id}.pkl")
+                if os.path.exists(pkl_path):
+                    with open(pkl_path, "rb") as f:
+                        helper = pickle.load(f)
+                    django_cache.set(helper_cache_key, helper, timeout=1800)
+                    print(f"[GET_HELPER] Successfully loaded pickled helper from disk for job_id={job_id}")
+            except Exception as e:
+                print(f"[GET_HELPER] Failed to load pickled helper for job {job_id}: {e}")
 
-    # Try loading from pickled helper on disk first for perfect fidelity
-    try:
-        import pickle
-        import os
-        from django.conf import settings
-        pkl_path = os.path.join(settings.MEDIA_ROOT, "helpers", f"{job_id}.pkl")
-        if os.path.exists(pkl_path):
-            with open(pkl_path, "rb") as f:
-                helper = pickle.load(f)
-            django_cache.set(helper_cache_key, helper, timeout=1800)
-            print(f"[GET_HELPER] Successfully loaded pickled helper from disk for job_id={job_id}")
-            return helper
-    except Exception as e:
-        print(f"[GET_HELPER] Failed to load pickled helper for job {job_id}: {e}")
+            if helper is None:
+                try:
+                    from .models import OptimizationHistory
+                    from .modules.packing_orchestrator import Prisms, run_final_code
+                    history = OptimizationHistory.objects.get(id=int(job_id))
+                    parts_data = history.uploaded_file_data
+                    buffer_spacing = history.parameters.get('buffer_spacing', 2)
+                    parent_block_sizes = history.parameters.get('parent_blocks_used', [])
+                    
+                    all_prisms = []
+                    for part in parts_data:
+                        bottom_len = part.get('Bottom Length', part.get('bottom_length', 0))
+                        top_len = part.get('Top Length', part.get('top_length', 0))
+                        width = part.get('Width', part.get('width', 0))
+                        height = part.get('Height', part.get('height', 0))
+                        mark = part.get('MARK', part.get('code', 'Part'))
+                        nos = part.get('Nos', part.get('requested', 0))
+                        
+                        size = [bottom_len, top_len, width, height]
+                        all_prisms.append(Prisms(mark, size, int(nos)))
+                        
+                    prism_list_sorted = sorted(all_prisms, key=lambda p: p.get_volume(), reverse=True)
+                    helper = run_final_code(prism_list_sorted, buffer=buffer_spacing, parent_block_sizes=parent_block_sizes)
+                    
+                    django_cache.set(helper_cache_key, helper, timeout=1800)
+                except Exception as e:
+                    print(f"[GET_HELPER] Error reconstructing helper for job {job_id}: {e}")
+                    helper = cache.get("latest_helper")
 
-    try:
-        from .models import OptimizationHistory
-        from .modules.packing_orchestrator import Prisms, run_final_code
-        history = OptimizationHistory.objects.get(id=int(job_id))
-        parts_data = history.uploaded_file_data
-        buffer_spacing = history.parameters.get('buffer_spacing', 2)
-        parent_block_sizes = history.parameters.get('parent_blocks_used', [])
-        
-        all_prisms = []
-        for part in parts_data:
-            bottom_len = part.get('Bottom Length', part.get('bottom_length', 0))
-            top_len = part.get('Top Length', part.get('top_length', 0))
-            width = part.get('Width', part.get('width', 0))
-            height = part.get('Height', part.get('height', 0))
-            mark = part.get('MARK', part.get('code', 'Part'))
-            nos = part.get('Nos', part.get('requested', 0))
-            
-            size = [bottom_len, top_len, width, height]
-            all_prisms.append(Prisms(mark, size, int(nos)))
-            
-        prism_list_sorted = sorted(all_prisms, key=lambda p: p.get_volume(), reverse=True)
-        helper = run_final_code(prism_list_sorted, buffer=buffer_spacing, parent_block_sizes=parent_block_sizes)
-        
-        django_cache.set(helper_cache_key, helper, timeout=1800)
-        return helper
-    except Exception as e:
-        print(f"[GET_HELPER] Error reconstructing helper for job {job_id}: {e}")
-        return cache.get("latest_helper")
+    if helper:
+        for b in helper.all_big_blocks:
+            b.parent_helper = helper
+    return helper
 
 
 @api_view(['POST'])
@@ -1433,6 +1434,10 @@ def upload_and_optimize(request):
             print(f"Optimization successful!")
             print(f"- Total blocks created: {len(helper.all_big_blocks)}")
             print(f"- Total scraps generated: {len(helper.all_scrap)}")
+            
+            # Associate parent_helper to block instances for consistent color mapping
+            for b in helper.all_big_blocks:
+                b.parent_helper = helper
             
             # Store helper in cache for visualization
             cache.set(
