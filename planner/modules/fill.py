@@ -426,7 +426,9 @@ def rotate(points, angle_deg, axis='z', pivot=(0, 0, 0), roundingoff = 2):
     """
     pts = np.array(points, dtype=float)
     if pts.ndim == 1:
-        pts = pts.reshape(1, 3)
+        # -1, not 1: a bare point is (3,) but an empty list is also 1-D, shape (0,),
+        # which reshape(1, 3) cannot produce. See Rotation.rotate in packing_orchestrator.
+        pts = pts.reshape(-1, 3)
 
     angle = np.radians(angle_deg)
     px, py, pz = pivot
@@ -465,7 +467,165 @@ def rotate(points, angle_deg, axis='z', pivot=(0, 0, 0), roundingoff = 2):
 
 
 
+# How many merge orders get_scrap_vol tries before keeping the least fragmented one.
+CANDIDATE_DECOMPOSITIONS = 8
+
+
+def occupied_boxes_from_staircase(end_coordinates, st_co):
+    """
+    The region taken up by the prisms fill_the_box placed, as axis-aligned boxes.
+
+    fill_the_box lays prisms out column by column in z, row by row in y, running along
+    x, and records the far corner [x1max, y1max, z1max] of every (column, row) strip in
+    end_coordinates. Each strip is therefore a box running from where the previous strip
+    ended to that corner, and the union of them is exactly the occupied region.
+
+    The near face of each strip is the previous strip's far face, so the buffer gap
+    between prisms is counted as occupied. That is deliberate: parts need that clearance,
+    so it must never be handed back out as usable scrap.
+    """
+    boxes = []
+    z_prev = st_co[2]
+
+    for col in sorted(end_coordinates):
+        rows = end_coordinates[col]
+        if not rows:
+            continue
+
+        y_prev = st_co[1]
+        z_top = max(corner[2] for corner in rows.values())
+
+        for row in sorted(rows):
+            x_far, y_far, z_far = rows[row]
+            boxes.append([st_co[0], y_prev, z_prev, x_far, y_far, z_far])
+            y_prev = y_far
+
+        z_prev = z_top
+
+    return boxes
+
+
+def free_boxes(occupied, st_co, Block_size, order=None, flips=None):
+    """
+    Decompose the space in a block that the occupied boxes do not cover.
+
+    Cutting the block along every face of every occupied box gives a grid whose cells
+    are each wholly free or wholly occupied, so the free cells are exactly the free
+    space. Greedily growing each free cell into a maximal run then yields disjoint
+    boxes whose union is that space - sound by construction, no case analysis.
+
+    order/flips choose which axis a run grows along first and from which end. Different
+    settings give different, equally valid decompositions; callers vary them to explore
+    alternative layouts.
+
+    Returns:
+        List of (start_coord, size) pairs.
+    """
+    lo = np.asarray(st_co, dtype=float)
+    hi = lo + np.asarray(Block_size, dtype=float)
+
+    cuts = []
+    for axis in range(3):
+        marks = {lo[axis], hi[axis]}
+        for box in occupied:
+            for value in (box[axis], box[axis + 3]):
+                if lo[axis] < value < hi[axis]:
+                    marks.add(float(value))
+        cuts.append(np.array(sorted(marks)))
+
+    dims = [len(c) - 1 for c in cuts]
+    if min(dims) <= 0:
+        return []
+
+    used = np.zeros(dims, dtype=bool)
+    for box in occupied:
+        span = []
+        for axis in range(3):
+            a = np.searchsorted(cuts[axis], max(box[axis], lo[axis]))
+            b = np.searchsorted(cuts[axis], min(box[axis + 3], hi[axis]))
+            span.append(slice(a, b))
+        used[tuple(span)] = True
+
+    if order is None:
+        order = (0, 1, 2)
+    if flips is None:
+        flips = (False, False, False)
+
+    def walk(axis):
+        rng = range(dims[axis])
+        return reversed(rng) if flips[axis] else rng
+
+    out = []
+    for i in walk(0):
+        for j in walk(1):
+            for k in walk(2):
+                if used[i, j, k]:
+                    continue
+
+                start = [i, j, k]
+                extent = [1, 1, 1]
+
+                # Grow the run one axis at a time, keeping it a solid box of free cells.
+                for axis in order:
+                    while start[axis] + extent[axis] < dims[axis]:
+                        probe = [slice(start[d], start[d] + extent[d]) for d in range(3)]
+                        probe[axis] = slice(start[axis] + extent[axis],
+                                            start[axis] + extent[axis] + 1)
+                        if used[tuple(probe)].any():
+                            break
+                        extent[axis] += 1
+
+                claimed = tuple(slice(start[d], start[d] + extent[d]) for d in range(3))
+                used[claimed] = True
+
+                corner = [float(cuts[d][start[d]]) for d in range(3)]
+                size = [float(cuts[d][start[d] + extent[d]] - cuts[d][start[d]])
+                        for d in range(3)]
+                out.append((corner, size))
+
+    return out
+
+
 def get_scrap_vol(end_coordinates, Block_size, st_co= [0,0,0], co_ordinates_list = []):
+    """
+    Free space left in a block after fill_the_box has packed it, as scrap boxes.
+
+    Returns:
+        (scrap_volumes, scrap_Boxes) - 8-corner coordinate lists, and
+        {'starting_co', 'Box_size'} dicts describing the same boxes.
+    """
+    import random
+
+    occupied = occupied_boxes_from_staircase(end_coordinates, st_co)
+
+    # Which axis a run grows along first decides how the same free space gets carved up,
+    # and the spread is wide: the poor orders shatter it into thin slivers nothing fits
+    # in, while good ones leave a few fat boxes. Try a handful of settings and keep the
+    # least fragmented. Sampling rather than fixing the order also keeps successive
+    # attempts different, which is what run_optimization_with_retries explores with.
+    candidates = []
+    for _ in range(CANDIDATE_DECOMPOSITIONS):
+        order = tuple(random.sample([0, 1, 2], 3))
+        flips = tuple(random.random() < 0.5 for _ in range(3))
+        boxes = free_boxes(occupied, st_co, Block_size, order=order, flips=flips)
+        biggest = max((size[0] * size[1] * size[2] for _, size in boxes), default=0.0)
+        candidates.append((len(boxes), -biggest, boxes))
+
+    boxes = min(candidates, key=lambda c: (c[0], c[1]))[2]
+
+    scrap_volumes = []
+    scrap_Boxes_new = []
+    for corner, size in boxes:
+        if min(size) <= 0:
+            continue
+        scrap_Boxes_new.append({'starting_co': corner, 'Box_size': size})
+        scrap_volumes.append(place_box(corner, length=size[0], width=size[1], height=size[2]))
+
+    return scrap_volumes, scrap_Boxes_new
+
+
+def get_scrap_vol_legacy(end_coordinates, Block_size, st_co= [0,0,0], co_ordinates_list = []):
+    """Superseded by get_scrap_vol. Kept for reference; its output is not sound."""
     from edges import get_type, process_groups, pre_z_edges, connect_lines_same_x, pre_x_edges, process_groups_yxz, group_by_common_y, pre_y_edges, group_by_common_x, y_edges_process, x_edges_process
     from scrap import get_scrap_volume_of_type4, get_scrap_volume_of_type3, get_scrap_volume_of_type2, get_scrap_volume_of_type1
     z_edges = pre_z_edges(end_coordinates)

@@ -397,3 +397,37 @@ class ScrapInventory(models.Model):
     @property
     def dimensions_str(self):
         return f"{self.length:.0f}×{self.width:.0f}×{self.height:.0f}"
+
+
+class SavedParentBlock(models.Model):
+    """
+    Parent (stock) block sizes saved permanently, so users do not have to
+    re-enter a custom size on every optimization run.
+    Shared across all users.
+    """
+    label = models.CharField(max_length=100, unique=True, help_text="e.g. 800×350×1870")
+
+    # Dimensions in mm
+    length = models.FloatField()
+    width = models.FloatField()
+    height = models.FloatField()
+
+    created_by = models.ForeignKey(
+        'auth.User', null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='saved_parent_blocks'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'saved_parent_block'
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"{self.label} ({self.length}×{self.width}×{self.height}mm)"
+
+    @property
+    def dimensions_str(self):
+        return f"{self.length:.0f}×{self.width:.0f}×{self.height:.0f}"

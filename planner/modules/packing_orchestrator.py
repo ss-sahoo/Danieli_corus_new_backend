@@ -584,8 +584,13 @@ class Rotation:
         """
         pts = np.array(points, dtype=float)
         if pts.ndim == 1:
-            pts = pts.reshape(1, 3)
-        
+            # -1, not 1: a bare point is (3,) but an empty list is also 1-D, shape (0,).
+            # reshape(1, 3) promotes the former and raises on the latter, and empty is a
+            # normal result here - get_scrap_vol returns no boxes when a scrap is packed
+            # with zero leftover. -1 maps (3,) -> (1, 3) and (0,) -> (0, 3), which then
+            # flows through the transform below unchanged.
+            pts = pts.reshape(-1, 3)
+
         angle = np.radians(angle_deg)
         px, py, pz = pivot
         
@@ -672,30 +677,34 @@ class People_helper:
                 continue
     
     def check_which_block_to_add(self, prism) -> List[float]:
-        """Determine which parent block size will pack the most prisms"""
-        size_list_global = []
-        prism_count_list_global = []
-        axis_order_list_global = []
-        
+        """
+        Determine which parent block size to open next for this prism.
+
+        Each candidate carries its own size rather than being addressed by index. Sizes the
+        prism cannot fit are skipped, so the surviving candidates no longer line up with
+        self.parent_block_sizes; selecting by index into that list returns a size the prism
+        does not fit, off by however many entries were skipped ahead of the winner.
+        run_final_code takes the returned size at face value, so the fill then fails and the
+        entire remaining quantity is abandoned with no attempt at a size that would have
+        worked. Keeping the size attached to its score makes that unrepresentable.
+        """
+        candidates = []  # (capacity, parent_size)
+
         for parent_size in self.parent_block_sizes:
-            size_list = []
-            prism_count_list = []
-            
             block = self.get_a_temp_block(parent_size, code='Temp')
             cond, rotation_axis_new = block.can_fit_with_rotation(prism, self.rotation_axis)
-            
+
             if not cond:
                 continue
-            
+
+            best_count = 0
             for axis_order in rotation_axis_new:
                 if len(axis_order) != 0:
                     rot = Rotation(axis_order=axis_order, pivot=block.start_coord)
                     size = rot.get_new_lwh(block.size)
                 else:
                     size = block.size
-                
-                size_list.append(size)
-                
+
                 # Test packing
                 co_ordinates_list, big_block_coordinate, end_coordinates, prism_count = fill_the_box(
                     prism,
@@ -703,28 +712,28 @@ class People_helper:
                     starting_co=block.start_coord,
                     buffer=self.buffer
                 )
-                prism_count_list.append(prism_count)
-            
-            if not prism_count_list:
+                if prism_count > best_count:
+                    best_count = prism_count
+
+            # can_fit_with_rotation ignores the buffer, so a size can pass it and still pack
+            # nothing. Such a size is not a candidate.
+            if best_count == 0:
                 continue
-            
-            prism_count_max = max(prism_count_list)
-            max_index = prism_count_list.index(prism_count_max)
-            axis_order_max = rotation_axis_new[max_index]
-            size_max = size_list[max_index]
-            
-            prism_count_list_global.append(prism_count_max)
-            size_list_global.append(size_max)
-            axis_order_list_global.append(axis_order_max)
-        
-        if not prism_count_list_global:
-            # Return first parent block size if none work well
+
+            candidates.append((best_count, parent_size))
+
+        if not candidates:
+            # No selected stock size can take this prism; the caller's fill will return None
+            # and the shortfall is reported to the user.
             return self.parent_block_sizes[0]
-        
-        prism_count_global_max = max(prism_count_list_global)
-        max_index = prism_count_list_global.index(prism_count_global_max)
-        
-        return self.parent_block_sizes[max_index]
+
+        # Highest capacity wins; max() keeps the first maximum, so ties still go to whichever
+        # size the caller listed first. That is deliberately unchanged - this function is
+        # fixing an indexing defect, not the selection objective. Scoring candidates by yield
+        # per unit stock volume instead of raw count measured ~5 m^3 (1.2%) cheaper across
+        # orderings on Sample_data_03, but it is a behavioural change that belongs in its own
+        # commit; see audit issue 8.
+        return max(candidates, key=lambda c: c[0])[1]
     
     def fill_the_prism_optimally(self, prism, scrap) -> Tuple:
         """

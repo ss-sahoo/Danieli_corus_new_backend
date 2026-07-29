@@ -1568,7 +1568,39 @@ def upload_and_optimize(request):
                     continue
             
             # Prepare prism summary
+            #
+            # Alongside the counts we report which parent blocks each part *could* fit in.
+            # Without that, a shortfall is ambiguous: a part may be missing because no
+            # selected stock size can ever hold it, or because the optimiser failed to
+            # place one that fits. Those need different actions from the user, so the
+            # response has to distinguish them rather than just reporting 'remaining'.
+            #
+            # The packer tries all six orientations, so "fits in some orientation" reduces
+            # to comparing sorted dimensions. Clearance is included because fill_the_box
+            # offsets the first part by the buffer on every axis.
+            def which_parents_fit(part):
+                need = sorted([
+                    float(part['Bottom Length']) + buffer_spacing,
+                    float(part['Width']) + buffer_spacing,
+                    float(part['Height']) + buffer_spacing,
+                ])
+                fitting = []
+                for idx, size in enumerate(parent_block_sizes):
+                    have = sorted([float(d) for d in size])
+                    if all(n <= h for n, h in zip(need, have)):
+                        fitting.append({
+                            'index': idx,
+                            'label': parent_labels[idx] if idx < len(parent_labels) else None,
+                            'dimensions': [float(d) for d in size],
+                        })
+                return fitting
+
+            def name_of(fit):
+                return fit['label'] or '{:g}x{:g}x{:g}'.format(*fit['dimensions'])
+
             prism_summary = []
+            unpackable_parts = []
+            unplaced_parts = []
             for part in parts_data:
                 # Find matching prism in helper
                 packed_count = 0
@@ -1576,20 +1608,77 @@ def upload_and_optimize(request):
                     for prism_info in block_info['prisms']:
                         if prism_info['code'] == part['MARK']:
                             packed_count += prism_info['count']
-                
+
+                remaining = max(0, part['Nos'] - packed_count)
+                fits_in = which_parents_fit(part)
+                placeable = len(fits_in) > 0
+                fit_names = ', '.join(name_of(f) for f in fits_in)
+
+                if remaining == 0:
+                    status = 'packed'
+                    reason = None
+                elif not placeable:
+                    status = 'does_not_fit_any_parent_block'
+                    reason = (
+                        "{} is {:g}x{:g}x{:g} mm and, with {:g} mm clearance, is larger than "
+                        "every selected parent block in all orientations. Add a bigger stock "
+                        "size or reduce the part.".format(
+                            part['MARK'], float(part['Bottom Length']), float(part['Width']),
+                            float(part['Height']), float(buffer_spacing))
+                    )
+                elif packed_count == 0:
+                    status = 'not_placed'
+                    reason = ("{} fits {} but the optimiser placed none of the {} required."
+                              .format(part['MARK'], fit_names, part['Nos']))
+                else:
+                    status = 'partially_placed'
+                    reason = ("{} of {} could not be placed, although {} fits {}."
+                              .format(remaining, part['Nos'], part['MARK'], fit_names))
+
                 prism_summary.append({
                     'code': part['MARK'],
                     'requested': part['Nos'],
                     'packed': packed_count,
-                    'remaining': max(0, part['Nos'] - packed_count),
+                    'remaining': remaining,
                     'bottom_length': part['Bottom Length'],
                     'top_length': part['Top Length'],
                     'width': part['Width'],
                     'height': part['Height'],
                     'volume': 0.5 * (part['Bottom Length'] + part['Top Length']) * part['Width'] * part['Height'],
-                    'packing_rate': (packed_count / part['Nos'] * 100) if part['Nos'] > 0 else 0
+                    'packing_rate': (packed_count / part['Nos'] * 100) if part['Nos'] > 0 else 0,
+                    'placeable': placeable,
+                    'fits_parent_blocks': fits_in,
+                    'status': status,
+                    'reason': reason
                 })
-            
+
+                if status == 'does_not_fit_any_parent_block':
+                    unpackable_parts.append({
+                        'code': part['MARK'],
+                        'requested': part['Nos'],
+                        'bottom_length': part['Bottom Length'],
+                        'top_length': part['Top Length'],
+                        'width': part['Width'],
+                        'height': part['Height'],
+                        'reason': reason
+                    })
+                elif status in ('not_placed', 'partially_placed'):
+                    unplaced_parts.append({
+                        'code': part['MARK'],
+                        'requested': part['Nos'],
+                        'packed': packed_count,
+                        'remaining': remaining,
+                        'fits_parent_blocks': fits_in,
+                        'reason': reason
+                    })
+
+            print(f"- Parts that fit NO parent block: {len(unpackable_parts)}"
+                  + (f" ({', '.join(p['code'] for p in unpackable_parts)})"
+                     if unpackable_parts else ""))
+            print(f"- Parts that fit but were not fully placed: {len(unplaced_parts)}"
+                  + (f" ({', '.join(p['code'] for p in unplaced_parts)})"
+                     if unplaced_parts else ""))
+
         except Exception as e:
             print(f"Error preparing results: {e}")
             traceback.print_exc()
@@ -1597,6 +1686,8 @@ def upload_and_optimize(request):
             blocks_info = []
             scraps_info = []
             prism_summary = []
+            unpackable_parts = []
+            unplaced_parts = []
             total_stock_volume = 0
             total_prism_volume = 0
             total_parts_packed = 0
@@ -1735,6 +1826,29 @@ def upload_and_optimize(request):
         # ====================
         # 8. PREPARE FINAL RESPONSE
         # ====================
+        # The headline message must not read as a clean success when parts were left out,
+        # otherwise a shortfall is only discoverable by scanning prism_summary by hand.
+        summary_message = (
+            f'Successfully packed {total_parts_packed} out of {total_requested} parts '
+            f'({total_parts_packed/total_requested*100:.1f}%) into {len(helper.all_big_blocks)} '
+            f'stock blocks with {efficiency:.2f}% efficiency in {optimization_duration:.2f} seconds.'
+            if total_requested > 0 else 'No parts to pack.'
+        )
+        if unpackable_parts:
+            summary_message += (
+                ' {} part type{} ({}) do{} not fit any selected parent block and could not be '
+                'packed at all.'.format(
+                    len(unpackable_parts), '' if len(unpackable_parts) == 1 else 's',
+                    ', '.join(p['code'] for p in unpackable_parts),
+                    'es' if len(unpackable_parts) == 1 else '')
+            )
+        if unplaced_parts:
+            summary_message += (
+                ' {} part type{} ({}) fit a selected parent block but were left short.'.format(
+                    len(unplaced_parts), '' if len(unplaced_parts) == 1 else 's',
+                    ', '.join(p['code'] for p in unplaced_parts))
+            )
+
         results = {
             'success': True,
             'efficiency': round(efficiency, 2),
@@ -1750,6 +1864,13 @@ def upload_and_optimize(request):
             'parent_blocks_used': parent_block_sizes,
             'parent_labels': parent_labels,
             'prism_summary': prism_summary,
+            # Parts no selected stock size can hold in any orientation. Non-empty means the
+            # user must change the stock selection - re-running will not help.
+            'unpackable_parts': unpackable_parts,
+            'has_unpackable_parts': len(unpackable_parts) > 0,
+            # Parts that DO fit a selected stock size but the optimiser left short.
+            'unplaced_parts': unplaced_parts,
+            'has_unplaced_parts': len(unplaced_parts) > 0,
             'optimization_parameters': {
                 'buffer_spacing': buffer_spacing,
                 'max_retries': max_retries,
@@ -1758,7 +1879,7 @@ def upload_and_optimize(request):
             },
             'history_saved': history_saved,
             'history_id': history_id,
-            'message': f'Successfully packed {total_parts_packed} out of {total_requested} parts ({total_parts_packed/total_requested*100:.1f}%) into {len(helper.all_big_blocks)} stock blocks with {efficiency:.2f}% efficiency in {optimization_duration:.2f} seconds.',
+            'message': summary_message,
             'timestamp': timezone.now().isoformat(),
             'user': request.user.username,
             'file_processed': {

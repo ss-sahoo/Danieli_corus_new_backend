@@ -27,6 +27,11 @@ from planner.inventory_views import (
     remove_from_inventory,
     update_scrap,
 )
+from planner.parent_block_views import (
+    list_parent_blocks,
+    create_parent_block,
+    delete_parent_block,
+)
 
 urlpatterns = [
     # Admin
@@ -49,6 +54,10 @@ urlpatterns = [
     path("api/inventory/add/", add_to_inventory, name="add_to_inventory"),
     path("api/inventory/<int:scrap_pk>/remove/", remove_from_inventory, name="remove_from_inventory"),
     path("api/inventory/<int:scrap_pk>/update/", update_scrap, name="update_scrap"),
+
+    path("api/parent-blocks/", list_parent_blocks, name="list_parent_blocks"),
+    path("api/parent-blocks/create/", create_parent_block, name="create_parent_block"),
+    path("api/parent-blocks/<int:block_pk>/delete/", delete_parent_block, name="delete_parent_block"),
 
     # API endpoints
     path('api/', include('planner.urls')),
