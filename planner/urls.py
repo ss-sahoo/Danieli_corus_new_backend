@@ -16,6 +16,7 @@ from .views import (
     get_optimization_history,
     get_optimization_details,
     toggle_executed,
+    rerun_history_optimization,
     # rename_optimization,
     delete_optimization_history,
     
@@ -89,6 +90,7 @@ urlpatterns = [
     path('optimization-history/', get_optimization_history, name='optimization-history'),
     path('optimization-history/<int:history_id>/', get_optimization_details, name='optimization-details'),
     path('optimization-history/<int:history_id>/toggle-executed/', toggle_executed, name='toggle-executed'),
+    path('optimization-history/<int:history_id>/rerun/', rerun_history_optimization, name='rerun-history-optimization'),
     # path('optimization-history/<int:history_id>/rename/', rename_optimization, name='rename-optimization'),
     path('optimization-history/delete/', delete_optimization_history, name='delete-optimization-history'),
-    ]
+]

@@ -2263,6 +2263,410 @@ def toggle_executed(request, history_id):
         }, status=500)
 
 
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def rerun_history_optimization(request, history_id):
+    """
+    Rerun an existing optimization with edited/updated inputs,
+    updating the existing history record instead of creating a new one.
+    """
+    try:
+        from django.utils import timezone
+        from django.core.cache import cache as django_cache
+        from django.conf import settings
+        import json
+        import pandas as pd
+        import os
+        import traceback
+        import shutil
+        import pickle
+        from .models import OptimizationHistory, ScrapInventory
+        
+        # 1. GET THE HISTORY RECORD
+        try:
+            if request.user.is_superuser or request.user.is_staff:
+                history = OptimizationHistory.objects.get(id=history_id)
+            else:
+                history = OptimizationHistory.objects.get(id=history_id, user=request.user)
+        except OptimizationHistory.DoesNotExist:
+            return Response({
+                'success': False,
+                'error': 'Optimization not found or access denied'
+            }, status=404)
+            
+        # 2. CHECK IF EXECUTED LOCK EXISTS
+        if history.is_executed:
+            return Response({
+                'success': False,
+                'error': 'This optimization has already been marked as Executed and cannot be edited.'
+            }, status=400)
+            
+        # 3. PARSE PAYLOAD
+        data = request.data
+        
+        # Parts list
+        parts_data = data.get('uploaded_file_data')
+        if not parts_data:
+            return Response({
+                'success': False,
+                'error': 'No parts data provided'
+            }, status=400)
+            
+        # Parent stock blocks
+        parent_blocks_data = data.get('parent_blocks') or data.get('selected_parents') or data.get('parent_blocks_data')
+        if not parent_blocks_data:
+            return Response({
+                'success': False,
+                'error': 'No parent stock blocks provided'
+            }, status=400)
+            
+        # Selected blocks for filtering (optional)
+        selected_blocks = data.get('selected_blocks', history.selected_blocks)
+        
+        # Buffer spacing
+        buffer_spacing = float(data.get('buffer_spacing', 2.0))
+        
+        # Max retries & Retry enabled
+        max_retries = int(data.get('max_retries', 5000))
+        retry_enabled = data.get('retry_enabled', True)
+        if isinstance(retry_enabled, str):
+            retry_enabled = retry_enabled.lower() == 'true'
+            
+        # 4. PROCESS PARENT BLOCKS
+        parent_block_sizes = []
+        parent_labels = []
+        
+        for i, block in enumerate(parent_blocks_data):
+            try:
+                if isinstance(block, dict):
+                    if 'dimensions' in block:
+                        dims = block['dimensions']
+                        length = float(dims.get('length', 0))
+                        width = float(dims.get('width', 0))
+                        height = float(dims.get('height', 0))
+                    elif 'length' in block and 'width' in block and 'height' in block:
+                        length = float(block['length'])
+                        width = float(block['width'])
+                        height = float(block['height'])
+                    else:
+                        continue
+                elif isinstance(block, list) and len(block) == 3:
+                    length = float(block[0])
+                    width = float(block[1])
+                    height = float(block[2])
+                else:
+                    continue
+                
+                if length <= 0 or width <= 0 or height <= 0:
+                    continue
+                    
+                parent_block_sizes.append([length, width, height])
+                label = block.get('label', f'{length}×{width}×{height}') if isinstance(block, dict) else f'{length}×{width}×{height}'
+                parent_labels.append(label)
+            except Exception as e:
+                continue
+                
+        if not parent_block_sizes:
+            return Response({
+                'success': False,
+                'error': 'No valid parent blocks provided'
+            }, status=400)
+            
+        # 5. FILTER SELECTED PARTS IF SPECIFIED
+        original_part_count = len(parts_data)
+        if selected_blocks:
+            parts_data = [p for p in parts_data if p.get('MARK') in selected_blocks]
+            
+        if not parts_data:
+            return Response({
+                'success': False,
+                'error': 'No parts match the selected filter blocks'
+            }, status=400)
+            
+        # 6. WRITE PARTS DATA TO TEMPORARY EXCEL OR CSV FOR PACKING ORCHESTRATOR
+        temp_dir = os.path.join(settings.MEDIA_ROOT, 'temp_uploads')
+        os.makedirs(temp_dir, exist_ok=True)
+        import uuid
+        
+        ext = ".xlsx"
+        if history.uploaded_file_name.lower().endswith(".csv"):
+            ext = ".csv"
+            
+        temp_filename = f"rerun_{uuid.uuid4().hex[:8]}_{history.uploaded_file_name}"
+        if not temp_filename.endswith(ext):
+            temp_filename += ext
+        temp_file_path = os.path.join(temp_dir, temp_filename)
+        
+        try:
+            # Map parameters in parts_data to correct casing if needed
+            standardized_parts = []
+            for part in parts_data:
+                standardized_parts.append({
+                    'MARK': str(part.get('MARK', part.get('mark', ''))).strip(),
+                    'Bottom Length': float(part.get('Bottom Length', part.get('bottom_length', part.get('BottomLength', 0)))),
+                    'Top Length': float(part.get('Top Length', part.get('top_length', part.get('TopLength', 0)))),
+                    'Width': float(part.get('Width', part.get('width', 0))),
+                    'Height': float(part.get('Height', part.get('height', 0))),
+                    'Nos': int(float(part.get('Nos', part.get('nos', part.get('quantity', 0)))))
+                })
+                
+            df_filtered = pd.DataFrame(standardized_parts)
+            if ext == ".csv":
+                df_filtered.to_csv(temp_file_path, index=False)
+            else:
+                df_filtered.to_excel(temp_file_path, index=False, engine='openpyxl')
+        except Exception as e:
+            return Response({
+                'success': False,
+                'error': f'Failed to write edited parts data: {str(e)}'
+            }, status=400)
+            
+        # 7. RUN OPTIMIZATION WITH RETRY LOGIC
+        optimization_start_time = timezone.now()
+        helper = None
+        block_details = None
+        
+        try:
+            if retry_enabled:
+                from .modules.packing_orchestrator import run_optimization_with_retries
+                helper, block_details = run_optimization_with_retries(
+                    excel_path=temp_file_path,
+                    parent_block_sizes=parent_block_sizes,
+                    buffer=buffer_spacing,
+                    max_tries=max_retries
+                )
+            else:
+                from .modules.packing_orchestrator import Prisms, run_final_code, get_block_details
+                all_prisms = []
+                for part in standardized_parts:
+                    size = [part['Bottom Length'], part['Top Length'], part['Width'], part['Height']]
+                    all_prisms.append(Prisms(code=part['MARK'], size=size, quantity=part['Nos']))
+                prism_list_sorted = sorted(all_prisms, key=lambda p: p.get_volume(), reverse=True)
+                helper = run_final_code(all_prisms=prism_list_sorted, buffer=buffer_spacing, parent_block_sizes=parent_block_sizes)
+                block_details = get_block_details(helper)
+                
+            if helper is None:
+                raise Exception("Optimization algorithm returned None")
+                
+            # Associate parent helper
+            for b in helper.all_big_blocks:
+                b.parent_helper = helper
+                
+        except Exception as e:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+            return Response({
+                'success': False,
+                'error': f'Optimization failed: {str(e)}'
+            }, status=500)
+            
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+            
+        optimization_end_time = timezone.now()
+        optimization_duration = (optimization_end_time - optimization_start_time).total_seconds()
+        
+        # 8. PREPARE RESULTS
+        try:
+            if block_details is None:
+                block_details = get_block_details(helper)
+                
+            total_parts_packed = 0
+            total_prism_volume = 0
+            total_requested = sum(part['Nos'] for part in standardized_parts)
+            
+            if block_details and 'blocks' in block_details:
+                for block in block_details['blocks']:
+                    if 'prisms' in block:
+                        for prism_info in block['prisms']:
+                            for part in standardized_parts:
+                                if part['MARK'] == prism_info['code']:
+                                    prism_volume = 0.5 * (part['Bottom Length'] + part['Top Length']) * part['Width'] * part['Height']
+                                    total_parts_packed += prism_info.get('number', 0)
+                                    total_prism_volume += prism_volume * prism_info.get('number', 0)
+                                    break
+                                    
+            total_stock_volume = sum(block.volume for block in helper.all_big_blocks)
+            efficiency = (total_prism_volume / total_stock_volume * 100) if total_stock_volume > 0 else 0
+            
+            blocks_info = []
+            for block in helper.all_big_blocks:
+                prism_counts = {}
+                for entry in block.prism_details:
+                    prism = entry['prism']
+                    count = len(entry['coordinates'])
+                    prism_counts[prism.code] = prism_counts.get(prism.code, 0) + count
+                prism_list = [{"code": code, "count": count} for code, count in prism_counts.items()]
+                
+                blocks_info.append({
+                    'code': block.unique_code,
+                    'size': [float(dim) for dim in block.size],
+                    'efficiency': float(block.get_efficiency()),
+                    'prisms': prism_list,
+                    'volume': float(block.volume),
+                    'start_coord': [float(coord) for coord in block.start_coord]
+                })
+                
+            scraps_info = []
+            for scrap in helper.all_scrap:
+                scraps_info.append({
+                    'code': scrap.unique_code,
+                    'size': [float(dim) for dim in scrap.size],
+                    'volume': float(scrap.volume),
+                    'start_coord': [float(coord) for coord in scrap.start_coord],
+                    'parent_block': scrap.parent_block.unique_code if scrap.parent_block else None
+                })
+                
+            prism_summary = []
+            for part in standardized_parts:
+                packed_count = 0
+                for block_info in blocks_info:
+                    for prism_info in block_info['prisms']:
+                        if prism_info['code'] == part['MARK']:
+                            packed_count += prism_info['count']
+                prism_summary.append({
+                    'code': part['MARK'],
+                    'requested': part['Nos'],
+                    'packed': packed_count,
+                    'remaining': max(0, part['Nos'] - packed_count),
+                    'bottom_length': part['Bottom Length'],
+                    'top_length': part['Top Length'],
+                    'width': part['Width'],
+                    'height': part['Height'],
+                    'volume': 0.5 * (part['Bottom Length'] + part['Top Length']) * part['Width'] * part['Height'],
+                    'packing_rate': (packed_count / part['Nos'] * 100) if part['Nos'] > 0 else 0
+                })
+                
+        except Exception as e:
+            traceback.print_exc()
+            return Response({
+                'success': False,
+                'error': f'Failed to process results structure: {str(e)}'
+            }, status=500)
+            
+        # 9. UPDATE DATABASE RECORD
+        # Delete old scraps associated with this history item first
+        ScrapInventory.objects.filter(optimization_history=history).delete()
+        
+        # Clear helper cache
+        django_cache.delete(f"helper_objs_{history.id}")
+        
+        # Update fields
+        optimization_results = {
+            'blocks': blocks_info,
+            'scraps': scraps_info,
+            'summary': {
+                'efficiency': round(efficiency, 2),
+                'total_parts_packed': total_parts_packed,
+                'total_parts_requested': total_requested,
+                'packing_percentage': round(total_parts_packed / total_requested * 100, 2) if total_requested > 0 else 0,
+                'total_blocks_created': len(helper.all_big_blocks),
+                'total_stock_volume': round(total_stock_volume, 2),
+                'total_prism_volume': round(total_prism_volume, 2),
+                'waste_percentage': round(100 - efficiency, 2),
+                'optimization_duration_seconds': round(optimization_duration, 2)
+            }
+        }
+        
+        history.uploaded_file_data = standardized_parts
+        if data.get('uploaded_file_name'):
+            history.uploaded_file_name = data.get('uploaded_file_name')
+        history.selected_blocks = selected_blocks
+        history.selected_parents = parent_labels
+        history.parameters = {
+            'buffer_spacing': buffer_spacing,
+            'parent_blocks_used': parent_block_sizes,
+            'parent_labels': parent_labels,
+            'max_retries': max_retries,
+            'retry_enabled': retry_enabled,
+            'original_part_count': original_part_count,
+            'filtered_part_count': len(standardized_parts),
+            'optimization_duration_seconds': optimization_duration
+        }
+        history.optimization_results = optimization_results
+        history.efficiency = round(efficiency, 2)
+        history.total_blocks_created = len(helper.all_big_blocks)
+        history.total_parts_packed = total_parts_packed
+        history.total_parts_requested = total_requested
+        history.prism_summary = prism_summary
+        history.save()
+        
+        # Save pickled helper to disk
+        helpers_dir = os.path.join(settings.MEDIA_ROOT, "helpers")
+        pkl_path = os.path.join(helpers_dir, f"{history.id}.pkl")
+        try:
+            with open(pkl_path, "wb") as f:
+                pickle.dump(helper, f)
+        except Exception as pkl_err:
+            print(f"Failed to save pickled helper: {pkl_err}")
+            
+        # Recache helper
+        django_cache.set(f"helper_objs_{history.id}", helper, timeout=1800)
+        django_cache.set("latest_helper", helper, timeout=60 * 60 * 24 * 7)
+        
+        # 10. REGENERATE BLOCK 6-SIDE VISUALIZATIONS
+        html_base_dir = os.path.join(settings.MEDIA_ROOT, "block_html", str(history.id))
+        if os.path.exists(html_base_dir):
+            try:
+                shutil.rmtree(html_base_dir)
+            except Exception as e:
+                print(f"Error removing old HTML dir: {e}")
+        os.makedirs(html_base_dir, exist_ok=True)
+        
+        for block in helper.all_big_blocks:
+            try:
+                generate_block_6_side_images(block, html_base_dir, block.unique_code)
+            except Exception as e:
+                print(f"Error generating block HTML: {e}")
+                
+        job_label = f"OPT-{history.id:04d}"
+        master_html_path = os.path.join(html_base_dir, f"{job_label}_All_Blocks_6_Sides.html")
+        try:
+            generate_all_blocks_master_html(helper.all_big_blocks, master_html_path, job_label)
+        except Exception as e:
+            print(f"Error generating master HTML: {e}")
+            
+        # Save scraps to DB matching execution state
+        try:
+            from .inventory_views import auto_save_scraps_from_optimization
+            auto_save_scraps_from_optimization(helper, history, request.user)
+        except Exception as inv_err:
+            print(f"Error auto saving scraps on rerun: {inv_err}")
+            
+        return Response({
+            'success': True,
+            'message': 'Optimization updated and rerun successfully',
+            'data': {
+                'id': history.id,
+                'job_name': history.job_name,
+                'created_at': history.created_at,
+                'efficiency': history.efficiency,
+                'uploaded_file_name': history.uploaded_file_name,
+                'uploaded_file_data': history.uploaded_file_data,
+                'selected_blocks': history.selected_blocks,
+                'selected_parents': history.selected_parents,
+                'parameters': history.parameters,
+                'optimization_results': history.optimization_results,
+                'is_executed': history.is_executed,
+                'label': history.label,
+                'label_color': history.label_color,
+                'username': history.user.username,
+                'summary': {
+                    'total_blocks_created': history.total_blocks_created,
+                    'total_parts_packed': history.total_parts_packed,
+                    'total_parts_requested': history.total_parts_requested,
+                    'is_successful': history.is_successful
+                }
+            }
+        })
+        
+    except Exception as e:
+        traceback.print_exc()
+        return Response({
+            'success': False,
+            'error': f'Rerun failed: {str(e)}'
+        }, status=500)
+
 
 # ================================
 # EXISTING VIEWSETS (UNCHANGED)
