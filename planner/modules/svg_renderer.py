@@ -164,9 +164,8 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
                         render_elements.append((depth, poly_svg))
                         polygons_drawn += 1
                 
-                # Concise labeling for G14, G15, G17, G18, G19, G20, G21 component blocks
-                p_code_upper = p_code_clean.upper()
-                if any(x in p_code_upper for x in ['G14', 'G15', 'G17', 'G18', 'G19', 'G20', 'G21']) or (p_code_upper.startswith('G') and len(p_code_upper) <= 5):
+                # Concise labeling for visible component/prism blocks (e.g. G17, T38B, etc.)
+                if p_code_clean:
                     projected_pts = [project_vertex(v) for v in coords]
                     xs = [pt[0] for pt in projected_pts]
                     ys = [pt[1] for pt in projected_pts]
@@ -178,8 +177,9 @@ def generate_svg_for_block_side(block, side_name, highlight_scrap=None, draw_pri
                     if width > 8.0 and height > 8.0:
                         cx = (min_x + max_x) / 2.0
                         cy = (min_y + max_y) / 2.0
-                        # Adaptive text sizing based on the projected prism dimensions with no hardcoded small maximum
-                        font_sz = max(10.0, min(height * 0.35, width * 0.25))
+                        # Adaptive text sizing based on the projected prism dimensions and label length
+                        str_len = max(1, len(p_code_clean))
+                        font_sz = max(8.0, min(height * 0.35, (width * 0.95) / str_len))
                         txt_el = f'<text x="{cx:.1f}" y="{cy:.1f}" text-anchor="middle" dominant-baseline="central" ' \
                                  f'font-size="{font_sz:.1f}px" font-weight="700" fill="#ffffff" ' \
                                  f'style="paint-order: stroke; stroke: #000000; stroke-width: 2px; stroke-linejoin: round; pointer-events: none;">' \
