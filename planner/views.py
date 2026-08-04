@@ -2100,6 +2100,7 @@ def get_optimization_details(request, history_id):
                 'label': history.label,
                 'label_color': history.label_color,
                 'username': history.user.username,
+                'prism_summary': history.prism_summary,
                 'summary': {
                     'total_blocks_created': history.total_blocks_created,
                     'total_parts_packed': history.total_parts_packed,
@@ -2651,6 +2652,7 @@ def rerun_history_optimization(request, history_id):
                 'label': history.label,
                 'label_color': history.label_color,
                 'username': history.user.username,
+                'prism_summary': history.prism_summary,
                 'summary': {
                     'total_blocks_created': history.total_blocks_created,
                     'total_parts_packed': history.total_parts_packed,
