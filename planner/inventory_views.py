@@ -208,7 +208,12 @@ def auto_save_scraps_from_optimization(helper, optimization_history, added_by):
             length, width, height = float(size[0]), float(size[1]), float(size[2])
             volume = float(scrap.volume)
 
-            parent_code = scrap.parent_block.unique_code if scrap.parent_block else 'UNK'
+            # A remnant of a racked offcut should trace back to that offcut's ID, not to the
+            # opaque R-code this run happened to give it, so the piece's history survives.
+            parent_block = scrap.parent_block
+            source_scrap_id = getattr(parent_block, 'source_scrap_id', None) if parent_block else None
+            parent_code = source_scrap_id or (parent_block.unique_code if parent_block else 'UNK')
+
             parent_counters[parent_code] = parent_counters.get(parent_code, 0) + 1
             scrap_id = f"{parent_code}-S{parent_counters[parent_code]}"
 
@@ -256,6 +261,39 @@ def mark_scraps_as_executed(optimization_history):
     ).update(is_in_inventory=True)
 
     print(f"[Inventory] Marked {updated} usable scraps in inventory for executed optimization #{optimization_history.id}")
+    return updated
+
+
+def mark_consumed_inventory_scraps(optimization_history):
+    """
+    Called when an optimization is marked as executed.
+
+    Retires the racked offcuts this job cut into. Consumption happens here rather than at
+    run time because a planned run may never be executed, and reserving stock for a plan
+    that is abandoned would hide usable material from every later job.
+
+    Together with mark_scraps_as_executed the loop closes on execute: the pieces that were
+    cut up leave inventory, and the remnants those cuts produced enter it.
+    """
+    from .models import ScrapInventory
+
+    params = optimization_history.parameters or {}
+    consumed_ids = params.get('consumed_scrap_inventory_ids') or []
+
+    if not consumed_ids:
+        return 0
+
+    note = f"Consumed by optimization #{optimization_history.id}."
+    updated = 0
+
+    for scrap in ScrapInventory.objects.filter(id__in=consumed_ids, is_in_inventory=True):
+        scrap.is_in_inventory = False
+        scrap.notes = f"{scrap.notes} {note}".strip() if scrap.notes else note
+        scrap.save(update_fields=['is_in_inventory', 'notes'])
+        updated += 1
+
+    print(f"[Inventory] Retired {updated} consumed scrap pieces for executed optimization "
+          f"#{optimization_history.id}")
     return updated
 
 

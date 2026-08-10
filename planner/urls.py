@@ -23,6 +23,7 @@ from .views import (
     # File upload and optimization
     upload_excel_file,
     upload_and_optimize,
+    upload_and_optimize_deep,
     
     # Visualization endpoints
     generate_block_visualization,
@@ -59,6 +60,9 @@ urlpatterns = [
     # ================================
     path('upload/', upload_excel_file, name='upload-excel'),
     path('upload-optimize/', upload_and_optimize, name='upload-optimize'),
+    # Slow, thorough sibling: searches subsets of the offered stock sizes, then repacks
+    # the winner with exhaustive scrap decomposition. Same payload and response shape.
+    path('upload-optimize-deep/', upload_and_optimize_deep, name='upload-optimize-deep'),
     path('upload-optimize-django/', upload_optimize_django, name='upload-optimize-django'),
     
     # ================================

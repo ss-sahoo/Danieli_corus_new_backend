@@ -55,10 +55,22 @@ def fill_the_box(trapezoid_prisms, Block_size =  [2000,800, 400],starting_co= [0
     x_max, y_max, z_max = x_min + length, y_min+width, z_min+height
     big_block_coordinate = [[x,y,z],[x+length,y,z], [x+length, y+width, z], [x, y+width, z], 
                             [x, y, z+height], [x+ length, y, z+height], [x+length, y+width, z+height], [x, y+ width, z+height]]
+    def kerf(value, wall):
+        """
+        Gap to leave in front of a part whose near face would sit at `value`.
+
+        buffer is the saw kerf, so it is only needed where a cut is actually made -
+        between one part and the next. The block's own face is already a finished
+        surface, so the first part in a row, the first row in a column and the first
+        column all sit flush against the wall. Insetting them, which is what this used
+        to do, threw away a buffer-wide strip down three faces of every block and put
+        the same phantom gap inside every scrap packed by this function.
+        """
+        return buffer if value > wall + 1e-9 else 0.0
+
     bottomsup = False
     pre_angle = 0
     co_ordinates_list=[]
-    buffer = buffer
     prism_count = 0
     is_new_row = True
     is_new_col = True
@@ -102,7 +114,8 @@ def fill_the_box(trapezoid_prisms, Block_size =  [2000,800, 400],starting_co= [0
         if is_new_row and not is_new_col:
             row_no += 1
             x, y, z = new_row_coordinate
-            co_ordinates, x1max, y1max, z1max = place_prism_flip(prism,buffer, coordinate=[x+buffer,y+buffer,z+buffer],flip = False)
+            bx, by, bz = kerf(x, x_min), kerf(y, y_min), kerf(z, z_min)
+            co_ordinates, x1max, y1max, z1max = place_prism_flip(prism,buffer, coordinate=[x+bx,y+by,z+bz],flip = False)
             #print(x1max, y1max, z1max, x, y, z)
 
             '''if x1max > x_max:
@@ -113,7 +126,9 @@ def fill_the_box(trapezoid_prisms, Block_size =  [2000,800, 400],starting_co= [0
                 is_new_row = True 
                 is_new_col = True
             else:
-                new_row_coordinate = [x,y+width+buffer,z]
+                # Far face of this row; the next one gets its kerf from kerf(), which
+                # now sees a value off the wall and so returns the buffer.
+                new_row_coordinate = [x,y1max,z]
                 is_new_col = False
                 is_new_row = False
                 end_coordinates[col_no-1][row_no] = [x1max, y1max, z1max]
@@ -124,10 +139,11 @@ def fill_the_box(trapezoid_prisms, Block_size =  [2000,800, 400],starting_co= [0
                 
         if is_new_row and is_new_col:
             x, y, z = new_col_coordinate
-            co_ordinates, x1max, y1max, z1max = place_prism_flip(prism, buffer,coordinate=[x+buffer,y+buffer,z+buffer],flip = False)
-    
-            new_row_coordinate = [x,y+width+buffer,z]
-            new_col_coordinate = [x, y,z+height+buffer]
+            bx, by, bz = kerf(x, x_min), kerf(y, y_min), kerf(z, z_min)
+            co_ordinates, x1max, y1max, z1max = place_prism_flip(prism, buffer,coordinate=[x+bx,y+by,z+bz],flip = False)
+
+            new_row_coordinate = [x,y1max,z]
+            new_col_coordinate = [x, y,z1max]
             is_new_col = False
             is_new_row = False
 
@@ -467,8 +483,41 @@ def rotate(points, angle_deg, axis='z', pivot=(0, 0, 0), roundingoff = 2):
 
 
 
+import itertools as _itertools
+from contextlib import contextmanager as _contextmanager
+
 # How many merge orders get_scrap_vol tries before keeping the least fragmented one.
 CANDIDATE_DECOMPOSITIONS = 8
+
+# Every (order, flips) setting free_boxes accepts: 3! axis orders x 2^3 flip choices.
+# Enumerating all of them is what the deep optimisation uses instead of sampling.
+ALL_DECOMPOSITIONS = [(o, f) for o in _itertools.permutations(range(3))
+                             for f in _itertools.product([False, True], repeat=3)]
+
+# Off by default, so the ordinary path samples exactly as before. The deep optimisation
+# flips this on around a run via the exhaustive_decomposition() context manager.
+# Module-level rather than an argument because get_scrap_vol is called from deep inside
+# fill_the_prism_optimally and threading a flag through would touch the whole call chain.
+EXHAUSTIVE_DECOMPOSITION = False
+
+
+@_contextmanager
+def exhaustive_decomposition(enabled=True):
+    """
+    Make get_scrap_vol enumerate every merge order instead of sampling 8 at random.
+
+    Measured on Sample_data_03: about +0.15 to +0.25 efficiency points for roughly 3x the
+    packing time, so it belongs in the deep optimisation only. Not thread-safe - it sets
+    module state, so do not run a deep search concurrently with a quick one in the same
+    process.
+    """
+    global EXHAUSTIVE_DECOMPOSITION
+    previous = EXHAUSTIVE_DECOMPOSITION
+    EXHAUSTIVE_DECOMPOSITION = enabled
+    try:
+        yield
+    finally:
+        EXHAUSTIVE_DECOMPOSITION = previous
 
 
 def occupied_boxes_from_staircase(end_coordinates, st_co):
@@ -586,9 +635,59 @@ def free_boxes(occupied, st_co, Block_size, order=None, flips=None):
     return out
 
 
-def get_scrap_vol(end_coordinates, Block_size, st_co= [0,0,0], co_ordinates_list = []):
+def apply_kerf(boxes, st_co, Block_size, buffer):
+    """
+    Pull each free box in by one kerf width on the faces a saw has to cut.
+
+    free_boxes returns the exact geometric complement of the occupied region, so a
+    scrap box sits flush against the prisms beside it and against its neighbouring
+    scrap boxes. Every one of those faces is a cut, and the cut destroys `buffer` of
+    material, so the piece that actually comes off the saw is smaller than the box.
+    Reporting the nominal size over-promises: it goes to ScrapInventory at that size
+    and comes back on a later run as an R-block bigger than the steel on the floor.
+
+    Faces lying on the frame boundary are left alone - that is the outer surface of
+    the stock block, or, when a scrap is being subdivided, of a scrap whose kerf was
+    already taken when it was created. No saw passes there.
+
+    The full buffer is taken on both sides of a scrap-to-scrap face even though one
+    cut separates the pair. Splitting it would be more exact, but scrap that
+    over-promises is the failure this is fixing, so the conservative side is right.
+    """
+    if buffer <= 0:
+        return boxes
+
+    lo = np.asarray(st_co, dtype=float)
+    hi = lo + np.asarray(Block_size, dtype=float)
+    tol = 1e-6
+
+    out = []
+    for corner, size in boxes:
+        new_corner = list(corner)
+        new_size = list(size)
+
+        for axis in range(3):
+            if corner[axis] > lo[axis] + tol:
+                new_corner[axis] += buffer
+                new_size[axis] -= buffer
+            if corner[axis] + size[axis] < hi[axis] - tol:
+                new_size[axis] -= buffer
+
+        # A sliver narrower than the cut that would free it is not a piece of steel.
+        if min(new_size) <= 0:
+            continue
+
+        out.append((new_corner, new_size))
+
+    return out
+
+
+def get_scrap_vol(end_coordinates, Block_size, st_co= [0,0,0], co_ordinates_list = [], buffer = 0.0):
     """
     Free space left in a block after fill_the_box has packed it, as scrap boxes.
+
+    buffer is the saw kerf; it is deducted from every cut face (see apply_kerf), so
+    the boxes returned are what can physically be lifted out, not the nominal gaps.
 
     Returns:
         (scrap_volumes, scrap_Boxes) - 8-corner coordinate lists, and
@@ -603,15 +702,32 @@ def get_scrap_vol(end_coordinates, Block_size, st_co= [0,0,0], co_ordinates_list
     # in, while good ones leave a few fat boxes. Try a handful of settings and keep the
     # least fragmented. Sampling rather than fixing the order also keeps successive
     # attempts different, which is what run_optimization_with_retries explores with.
+    #
+    # The deep optimisation enumerates all 48 instead. That removes the run-to-run
+    # variation as well as the sampling miss, which is fine there: deep mode is not
+    # relying on retries to explore.
+    if EXHAUSTIVE_DECOMPOSITION:
+        settings_to_try = ALL_DECOMPOSITIONS
+    else:
+        settings_to_try = [(tuple(random.sample([0, 1, 2], 3)),
+                            tuple(random.random() < 0.5 for _ in range(3)))
+                           for _ in range(CANDIDATE_DECOMPOSITIONS)]
+
     candidates = []
-    for _ in range(CANDIDATE_DECOMPOSITIONS):
-        order = tuple(random.sample([0, 1, 2], 3))
-        flips = tuple(random.random() < 0.5 for _ in range(3))
+    for order, flips in settings_to_try:
         boxes = free_boxes(occupied, st_co, Block_size, order=order, flips=flips)
         biggest = max((size[0] * size[1] * size[2] for _, size in boxes), default=0.0)
         candidates.append((len(boxes), -biggest, boxes))
 
     boxes = min(candidates, key=lambda c: (c[0], c[1]))[2]
+
+    # Kerf comes off the winner, not off every candidate before ranking. Ranking on the
+    # cut sizes was measured worse: it trades a fraction of a percent of scrap volume for
+    # ~20% more pieces, each smaller, which is the fragmentation this whole step exists to
+    # avoid. It also lets a candidate whose boxes are all culled as slivers score as the
+    # least fragmented of the lot. Which carving is least fragmented is a question about
+    # the free space itself; the kerf is a uniform inset that does not change the answer.
+    boxes = apply_kerf(boxes, st_co, Block_size, buffer)
 
     scrap_volumes = []
     scrap_Boxes_new = []

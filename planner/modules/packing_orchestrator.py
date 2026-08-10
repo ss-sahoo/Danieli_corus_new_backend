@@ -7,6 +7,7 @@ import math
 import numpy as np
 import pandas as pd
 import json
+from contextlib import contextmanager
 from typing import List, Dict, Tuple, Optional, Any
 
 # Import from fill module (ensure this exists in your project)
@@ -14,6 +15,69 @@ from .fill import fill_the_box, draw, get_scrap_vol
 
 # Tolerance for treating two solids as touching rather than overlapping (mm).
 OVERLAP_TOL = 1e-4
+
+
+# ---------------------------------------------------------------------------
+# Part-type processing order
+# ---------------------------------------------------------------------------
+# run_optimization_with_retries processes part types largest-volume-first. That single
+# choice is worth about 13 points of efficiency on Sample_data_03 - volume-ascending
+# scores 66.8% where volume-descending scores 80.4% - so it is the most sensitive knob
+# in the pipeline, and it has never been varied.
+#
+# Volume-descending is the best of the obvious orderings, but it is not optimal: small
+# perturbations of it beat it by up to +0.3 points. The deep optimisation searches those
+# perturbations. A perturbation is identified by an integer seed so the winning order can
+# be reproduced exactly on the final run; seed 0 (or None) is plain volume-descending.
+
+PRISM_ORDER_SEED = None
+
+# Largest number of adjacent transpositions a perturbation may apply. Past roughly this
+# many the order stops resembling volume-descending and the result degrades toward the
+# random-shuffle score (77%).
+MAX_ORDER_SWAPS = 8
+
+
+def perturb_prism_order(prisms: List['Prisms'], seed: Optional[int]) -> List['Prisms']:
+    """
+    Nudge a volume-descending ordering without destroying it.
+
+    Adjacent transpositions only: they reorder neighbours of similar volume and leave the
+    big-parts-first structure intact. A full shuffle is a different, much worse ordering,
+    not a perturbation of this one.
+    """
+    if not seed:
+        return prisms
+
+    import random
+    rnd = random.Random(seed)
+    out = list(prisms)
+    if len(out) < 2:
+        return out
+
+    for _ in range(rnd.randint(1, MAX_ORDER_SWAPS)):
+        i = rnd.randrange(len(out) - 1)
+        out[i], out[i + 1] = out[i + 1], out[i]
+
+    return out
+
+
+@contextmanager
+def prism_order(seed: Optional[int]):
+    """
+    Run the packer with a specific ordering perturbation.
+
+    Module state rather than an argument, for the same reason as fill.exhaustive_decomposition:
+    the ordering is applied inside run_optimization_with_retries and threading it through
+    every caller would touch the whole request path. Not thread-safe.
+    """
+    global PRISM_ORDER_SEED
+    previous = PRISM_ORDER_SEED
+    PRISM_ORDER_SEED = seed
+    try:
+        yield
+    finally:
+        PRISM_ORDER_SEED = previous
 
 
 def get_prism_color_mapping(block):
@@ -311,6 +375,13 @@ class Block:
         self.scraps = []  # List of Scrap objects
         self.prism_details = []  # List of {prism, coordinates}
         self.all_prisms_coordinates = []
+
+        # A recovered block is a physical offcut pulled back out of ScrapInventory rather
+        # than new stock. It packs exactly like a bought block, but it must not be counted
+        # as material purchased, so efficiency and block counts exclude it. See
+        # People_helper.add_recovered_block.
+        self.is_recovered = False
+        self.source_scrap_id = None
     
     def add_scrap(self, scrap_obj):
         """Add a scrap piece to this block"""
@@ -450,7 +521,15 @@ class Scrap(Block):
     def __init__(self, unique_code: str, size: List[float], start_coord: List[float]):
         super().__init__(unique_code, size, start_coord)
         self.parent_block = None
-    
+        # Where this piece came from. 'generated' means it is leftover space this run just
+        # cut out of a stock block; 'inventory' means it is a physical offcut pulled off the
+        # rack and offered as input stock. The run summary counts only 'inventory' pieces as
+        # material consumed - a 'generated' scrap is already inside a stock block that has
+        # been counted, so counting it again would double-count the same steel.
+        self.origin = 'generated'
+        self.inventory_scrap_id = None  # set when origin == 'inventory', matches ScrapInventory.scrap_id
+
+
     def delete_scrap(self):
         """Remove this scrap from its parent block"""
         if self.parent_block and self in self.parent_block.scraps:
@@ -630,33 +709,146 @@ class Rotation:
 class People_helper:
     """Main packing orchestrator"""
     
-    def __init__(self, buffer: float = 2, parent_block_sizes: List[List[float]] = None):
+    def __init__(self, buffer: float = 2, parent_block_sizes: List[List[float]] = None,
+                 parent_block_quantities: List[Optional[int]] = None):
         """
         Initialize the packing helper
-        
+
         Args:
             buffer: Spacing between parts (mm)
             parent_block_sizes: Available stock block dimensions
+            parent_block_quantities: How many of each parent size may be opened, parallel to
+                parent_block_sizes. An entry of None means unlimited. Omitting the argument
+                entirely makes every size unlimited, which is the historical behaviour.
         """
         self.all_scrap = []
         self.scrap_count = 0
         self.big_block_count = 0
+        self.recovered_block_count = 0
         self.all_big_blocks = []
         self.rotation_axis = [[], ['z'], ['z', 'x'], ['z', 'y'], ['x'], ['y']]
-        
+
         self.buffer = buffer
         self.parent_block_sizes = parent_block_sizes or [[1870, 800, 350]]
         self.all_scrap_temp = []
         self.rejected_scrap_count = 0  # scrap boxes discarded as unsound, see add_update_scrap_list
+        self.consumed_scraps = []  # scraps that had prisms packed into them, see delete_scrap
 
-    def add_one_big_block(self, size: List[float], code: str = 'B') -> Block:
-        """Create a new stock block"""
+        # Mutable per-run stock ledger, parallel to parent_block_sizes. None = unlimited,
+        # an int counts down as blocks are opened and is refunded when a fill fails.
+        if parent_block_quantities is None:
+            self.parent_block_quantities = [None] * len(self.parent_block_sizes)
+        else:
+            self.parent_block_quantities = list(parent_block_quantities)
+            # Never let a short list silently make trailing sizes unlimited or raise later.
+            while len(self.parent_block_quantities) < len(self.parent_block_sizes):
+                self.parent_block_quantities.append(None)
+        self.remaining_quantity = list(self.parent_block_quantities)
+
+        # prism code -> 'stock_exhausted' | 'no_fit', set when a part could not be finished.
+        # The view turns this into the status it reports, since the two need different
+        # advice: one is fixed by offering more stock, the other only by a bigger size.
+        self.shortfall_reasons = {}
+
+    def any_quota_spent(self) -> bool:
+        """True when some limited parent size has been used up entirely."""
+        return any(q == 0 for q in self.remaining_quantity)
+
+    def add_one_big_block(self, size: List[float], code: str = 'B',
+                          size_index: Optional[int] = None) -> Block:
+        """
+        Create a new stock block, charging it against that size's quota.
+
+        size_index identifies which entry of parent_block_sizes is being consumed. It is
+        passed explicitly rather than looked up by dimensions because two entries may share
+        dimensions while carrying different quotas.
+        """
         self.big_block_count += 1
         starting_point = [0, 0, 0]
         block = Block(code + str(self.big_block_count), size, start_coord=starting_point)
+        block.size_index = size_index
         self.all_big_blocks.append(block)
+
+        if size_index is not None and self.remaining_quantity[size_index] is not None:
+            self.remaining_quantity[size_index] -= 1
+
         return block
-    
+
+    def refund_big_block(self, block: Block):
+        """
+        Undo add_one_big_block after a failed fill.
+
+        Without the quota being handed back, a fill that placed nothing still burns a unit
+        of scarce stock, and a size with quantity 1 can end up unavailable having produced
+        no parts at all.
+        """
+        if block in self.all_big_blocks:
+            self.all_big_blocks.remove(block)
+        self.big_block_count -= 1
+
+        size_index = getattr(block, 'size_index', None)
+        if size_index is not None and self.remaining_quantity[size_index] is not None:
+            self.remaining_quantity[size_index] += 1
+
+    def add_recovered_block(self, size: List[float], source: Dict[str, Any] = None) -> Block:
+        """
+        Seed one physical offcut from inventory as packable space (supply stage 1).
+
+        The piece becomes a Block coded R1, R2... carrying a single full-size Scrap over
+        itself. run_final_code already tries every prism against all_scrap before opening
+        any new stock, so seeding is all that stage 1 needs - no change to the packing loop.
+
+        R-blocks use their own counter so they never disturb B-numbering, and the seed scrap
+        is registered through add_update_scrap_list like any other: a fresh block has no
+        placed prisms, so it passes the overlap checks, and the chokepoint stays the single
+        place scraps enter the system.
+        """
+        source = source or {}
+
+        self.recovered_block_count += 1
+        block = Block('R' + str(self.recovered_block_count), list(size), start_coord=[0, 0, 0])
+        block.is_recovered = True
+        block.source_scrap_id = source.get('scrap_id')
+        block.source_inventory_id = source.get('id')
+        block.size_index = None
+        self.all_big_blocks.append(block)
+
+        seed = Block('tmp', list(size), start_coord=[0, 0, 0])
+        created = self.add_update_scrap_list(block, [seed.box_coordinate])
+
+        # Tag the seed so delete_scrap can report which racked piece a job actually cut
+        # into; run_summary keys its inventory reporting off exactly these two attributes.
+        for s in created:
+            s.origin = 'inventory'
+            s.inventory_scrap_id = source.get('scrap_id')
+            s.inventory_id = source.get('id')
+
+        return block
+
+    def prune_unused_recovered_blocks(self) -> List[Block]:
+        """
+        Drop offered inventory pieces that nothing was packed into.
+
+        Required, not cosmetic: auto_save_scraps_from_optimization walks all_scrap and
+        writes a ScrapInventory row per entry, so an untouched R-block's seed scrap would
+        create a second row for a piece that is already in inventory - the same physical
+        offcut counted twice on every run that offers it.
+        """
+        removed = []
+        for block in self.all_big_blocks[:]:
+            if not getattr(block, 'is_recovered', False) or block.prism_details:
+                continue
+
+            for scrap in block.scraps[:]:
+                if scrap in self.all_scrap:
+                    self.all_scrap.remove(scrap)
+            block.scraps = []
+
+            self.all_big_blocks.remove(block)
+            removed.append(block)
+
+        return removed
+
     def get_a_temp_block(self, size: List[float], code: str = 'Temp') -> Block:
         """Create a temporary block for testing"""
         starting_point = [0, 0, 0]
@@ -676,21 +868,35 @@ class People_helper:
             if result[0] is None:  # Check if packing failed
                 continue
     
-    def check_which_block_to_add(self, prism) -> List[float]:
+    def check_which_block_to_add(self, prism) -> Optional[int]:
         """
-        Determine which parent block size to open next for this prism.
+        Choose which parent block size to open next for this prism, or None.
 
-        Each candidate carries its own size rather than being addressed by index. Sizes the
-        prism cannot fit are skipped, so the surviving candidates no longer line up with
-        self.parent_block_sizes; selecting by index into that list returns a size the prism
-        does not fit, off by however many entries were skipped ahead of the winner.
-        run_final_code takes the returned size at face value, so the fill then fails and the
-        entire remaining quantity is abandoned with no attempt at a size that would have
-        worked. Keeping the size attached to its score makes that unrepresentable.
+        Returns the INDEX into parent_block_sizes, not the size: two entries may share
+        dimensions while carrying different quotas, so a size alone does not identify what
+        is being spent. (An earlier revision returned the size looked up by position in a
+        list that skipped non-fitting entries, which silently returned a size the prism did
+        not fit.)
+
+        Ranking is (tier, waste_per_part), smallest first:
+
+        - tier 0 is a size with a finite quantity, tier 1 a size with unlimited supply, so
+          stock already owned is exhausted before more is bought. This is supply stage 2
+          (fixed blocks) taking strict precedence over stage 3 (the open market).
+        - within a tier, the size consuming the least stock volume per part packed wins,
+          which is what "minimise blocks" means once sizes differ. Measured ~1.2% less
+          material than the old raw-count objective on Sample_data_03; see NESTING_AUDIT.md
+          issue 8.
+
+        Returns None when nothing is available - either every fitting size is used up or no
+        size fits at all. The caller distinguishes the two via any_quota_spent().
         """
-        candidates = []  # (capacity, parent_size)
+        candidates = []  # (tier, waste_per_part, index, parent_size)
 
-        for parent_size in self.parent_block_sizes:
+        for idx, parent_size in enumerate(self.parent_block_sizes):
+            if self.remaining_quantity[idx] == 0:
+                continue  # quota spent
+
             block = self.get_a_temp_block(parent_size, code='Temp')
             cond, rotation_axis_new = block.can_fit_with_rotation(prism, self.rotation_axis)
 
@@ -720,21 +926,15 @@ class People_helper:
             if best_count == 0:
                 continue
 
-            candidates.append((best_count, parent_size))
+            tier = 0 if self.remaining_quantity[idx] is not None else 1
+            waste_per_part = (parent_size[0] * parent_size[1] * parent_size[2]) / best_count
+            candidates.append((tier, waste_per_part, idx, parent_size))
 
         if not candidates:
-            # No selected stock size can take this prism; the caller's fill will return None
-            # and the shortfall is reported to the user.
-            return self.parent_block_sizes[0]
+            return None
 
-        # Highest capacity wins; max() keeps the first maximum, so ties still go to whichever
-        # size the caller listed first. That is deliberately unchanged - this function is
-        # fixing an indexing defect, not the selection objective. Scoring candidates by yield
-        # per unit stock volume instead of raw count measured ~5 m^3 (1.2%) cheaper across
-        # orderings on Sample_data_03, but it is a behavioural change that belongs in its own
-        # commit; see audit issue 8.
-        return max(candidates, key=lambda c: c[0])[1]
-    
+        return min(candidates, key=lambda c: (c[0], c[1]))[2]
+
     def fill_the_prism_optimally(self, prism, scrap) -> Tuple:
         """
         Fill a block/scrap with prisms optimally
@@ -794,7 +994,8 @@ class People_helper:
                 starting_co=[0, 0, 0],
                 buffer=self.buffer
             )
-            scrap_volumes, scrap_Boxes_new = get_scrap_vol(end_coordinates, size_max, [0, 0, 0], co_ordinates_list)
+            scrap_volumes, scrap_Boxes_new = get_scrap_vol(end_coordinates, size_max, [0, 0, 0], co_ordinates_list,
+                                                           buffer=self.buffer)
 
             # Translate from origin frame to the rotated frame's position
             offset = np.array(new_starting_point, dtype=float)
@@ -814,7 +1015,8 @@ class People_helper:
                 starting_co=scrap.start_coord,
                 buffer=self.buffer
             )
-            scrap_volumes, scrap_Boxes_new = get_scrap_vol(end_coordinates, size_max, scrap.start_coord, co_ordinates_list)
+            scrap_volumes, scrap_Boxes_new = get_scrap_vol(end_coordinates, size_max, scrap.start_coord, co_ordinates_list,
+                                                           buffer=self.buffer)
         
         if prism_count == 0:
             return None, None, None, None, None
@@ -891,9 +1093,27 @@ class People_helper:
         return scrap_blocks_list_temp
     
     def delete_scrap(self, scrap: Scrap):
-        """Remove a scrap from tracking"""
+        """
+        Remove a scrap from tracking.
+
+        This is the only place a scrap is retired, and it is only ever called after prisms
+        have been packed into it (see fill_the_prism_optimally), so a scrap passing through
+        here is one that was used. Recording it is what lets the run summary report which
+        racked offcuts a job consumed once inventory scraps are offered as input stock;
+        without it the piece simply vanishes from all_scrap and the usage is unrecoverable.
+        """
         if scrap in self.all_scrap:
             self.all_scrap.remove(scrap)
+
+        self.consumed_scraps.append({
+            'code': scrap.unique_code,
+            'origin': getattr(scrap, 'origin', 'generated'),
+            'inventory_scrap_id': getattr(scrap, 'inventory_scrap_id', None),
+            'size': [float(d) for d in scrap.size],
+            'volume': float(scrap.volume),
+            'parent_block': scrap.parent_block.unique_code if scrap.parent_block else None,
+        })
+
         scrap.delete_scrap()
 
 
@@ -999,59 +1219,71 @@ def get_block_details(helper: People_helper) -> Dict[str, Any]:
     Returns:
         Dictionary with block details, efficiency, and scrap information
     """
+    new_blocks = [b for b in helper.all_big_blocks if not getattr(b, 'is_recovered', False)]
+
     block_details = {
-        "Total_number_of_blocks": len(helper.all_big_blocks),
+        "Total_number_of_blocks": len(new_blocks),
+        "Total_number_of_recovered_blocks": len(helper.all_big_blocks) - len(new_blocks),
         "Total_stock_volume": 0,
         "Total_prism_volume": 0,
         "Total_eff": 0,
         "blocks": [],
         "scraps": []
     }
-    
+
     total_eff_sum = 0
     total_stock_volume = 0
     total_prism_volume = 0
-    
+
     # Process all blocks
     for block in helper.all_big_blocks:
         block_eff = round(block.get_efficiency(), 2)
         size = block.size
-        total_stock_volume += size[0] * size[1] * size[2]
-        total_eff_sum += block_eff
-        
+        is_recovered = getattr(block, 'is_recovered', False)
+
+        # Recovered blocks are material already paid for, so they are excluded from every
+        # aggregate here. Both the stock and the prism term must be excluded together, or
+        # efficiency exceeds 100% as soon as much of the demand comes out of scrap.
+        if not is_recovered:
+            total_stock_volume += size[0] * size[1] * size[2]
+            total_eff_sum += block_eff
+
         # Count prisms by code
         prism_count_dict = {}
         for entry in block.prism_details:
             prism = entry['prism']
             count = len(entry['coordinates'])
             volume = prism.get_volume()
-            total_prism_volume += volume * count
-            
+            if not is_recovered:
+                total_prism_volume += volume * count
+
             if prism.code not in prism_count_dict:
                 prism_count_dict[prism.code] = 0
             prism_count_dict[prism.code] += count
-        
+
         prism_list = [
             {"code": code, "number": num}
             for code, num in prism_count_dict.items()
         ]
-        
+
         block_details["blocks"].append({
             "code": block.unique_code,
             "eff": block_eff,
             "size": size,
-            "prisms": prism_list
+            "prisms": prism_list,
+            "is_recovered": is_recovered,
+            "source_scrap_id": getattr(block, 'source_scrap_id', None)
         })
-    
+
     # Calculate total efficiency
-    if len(helper.all_big_blocks) > 0:
-        block_details["Total_eff"] = round(total_eff_sum / len(helper.all_big_blocks), 2)
+    if len(new_blocks) > 0:
+        block_details["Total_eff"] = round(total_eff_sum / len(new_blocks), 2)
     else:
         block_details["Total_eff"] = 0
-    
+
     block_details["Total_stock_volume"] = total_stock_volume
     block_details["Total_prism_volume"] = total_prism_volume
-    
+
     # Add scraps
     for scrap in helper.all_scrap:
         block_details["scraps"].append({
@@ -1063,54 +1295,98 @@ def get_block_details(helper: People_helper) -> Dict[str, Any]:
     return block_details
 
 
-def run_final_code(all_prisms: List[Prisms], buffer: float = 2, 
-                   parent_block_sizes: List[List[float]] = None) -> People_helper:
+def run_final_code(all_prisms: List[Prisms], buffer: float = 2,
+                   parent_block_sizes: List[List[float]] = None,
+                   parent_block_quantities: List[Optional[int]] = None,
+                   recovered_stock: List[Dict[str, Any]] = None) -> People_helper:
     """
-    Main packing algorithm
-    
+    Main packing algorithm.
+
+    Demand is met from three sources, cheapest first, so the number of new blocks opened is
+    as small as the supply allows:
+
+      1. recovered scrap - offcuts pulled back out of inventory, seeded as R-blocks before
+         the loop starts. try_to_pack_inside_all_scrap runs before any stock is opened, so
+         every prism is offered this material first and costs nothing.
+      2. fixed blocks - parent sizes with a finite quantity on hand, preferred by
+         check_which_block_to_add's tier-0 rule until their quota is spent.
+      3. new stock - parent sizes with no quantity limit, the historical behaviour, applied
+         to whatever demand the first two stages could not absorb.
+
     Args:
         all_prisms: List of Prism objects to pack
         buffer: Spacing between parts
         parent_block_sizes: Available stock block dimensions
-    
+        parent_block_quantities: Units available per parent size, parallel to
+            parent_block_sizes; None entries (or the whole argument) mean unlimited
+        recovered_stock: Inventory offcuts to cut into first, each
+            {'id', 'scrap_id', 'size': [l, w, h]}
+
     Returns:
         People_helper object with packing results
     """
     if parent_block_sizes is None:
         parent_block_sizes = [[2000, 800, 400], [2000, 500, 500]]
-    
-    helper = People_helper(buffer, parent_block_sizes)
-    
+
+    helper = People_helper(buffer, parent_block_sizes, parent_block_quantities)
+
+    # Stage 1: offer inventory offcuts as packable space before any stock is opened.
+    for piece in (recovered_stock or []):
+        try:
+            size = [float(d) for d in piece['size']]
+            if min(size) <= 0:
+                continue
+            helper.add_recovered_block(size, source=piece)
+        except Exception as e:
+            print(f"Warning: could not seed recovered scrap {piece!r}: {e}")
+            continue
+
     for prism in all_prisms[:]:
-        # Try to pack into existing scraps
+        # Try to pack into existing scraps - recovered inventory on the first part, plus
+        # everything earlier parts left behind.
         helper.try_to_pack_inside_all_scrap(prism)
-        
-        # Pack remaining prisms into new blocks
+
+        # Stages 2 and 3: pack whatever is left into fixed then unlimited stock.
         while prism.prism_left > 0:
             # Determine best block size
-            size = helper.check_which_block_to_add(prism)
-            
+            size_index = helper.check_which_block_to_add(prism)
+
+            if size_index is None:
+                # Expected outcome under a quota, not an error: either the fitting sizes are
+                # used up or none fits. Opening a fallback block here (as this once did)
+                # would create one that cannot be filled and would spend stock to do it.
+                helper.shortfall_reasons[prism.code] = (
+                    'stock_exhausted' if helper.any_quota_spent() else 'no_fit')
+                print(f"Warning: no stock available for remaining {prism.prism_left} "
+                      f"units of {prism.code} ({helper.shortfall_reasons[prism.code]})")
+                break
+
             # Create new block
-            b = helper.add_one_big_block(size)
-            
+            b = helper.add_one_big_block(parent_block_sizes[size_index], size_index=size_index)
+
             # Fill the block
             result = helper.fill_the_prism_optimally(prism, b)
-            
+
             if result[0] is None:
                 # Packing failed - discard the empty block just created so it
                 # doesn't inflate block count / deflate reported efficiency,
+                # refund its quota so a scarce size is not spent for nothing,
                 # and break to avoid an infinite loop. The prism stays in the
                 # summary as "remaining" (could not be packed).
-                helper.all_big_blocks.remove(b)
-                helper.big_block_count -= 1
+                helper.refund_big_block(b)
+                helper.shortfall_reasons[prism.code] = 'no_fit'
                 print(f"Warning: Could not pack remaining {prism.prism_left} units of {prism.code}")
                 break
-            
+
             co_ordinates_list, big_block_coordinate, scrap_volumes, prism_count, scrap_blocks_list_temp = result
-            
+
             # Try to pack into newly created scraps
             helper.try_to_pack_inside_all_scrap(prism, scrap_blocks_list_temp)
-    
+
+    # Offered pieces nothing was cut from are not part of this plan, and leaving them in
+    # would duplicate them in inventory. See prune_unused_recovered_blocks.
+    helper.prune_unused_recovered_blocks()
+
     return helper
 
 
@@ -1142,25 +1418,44 @@ def get_all_prisms(excel_path: str) -> List[Prisms]:
 
 
 def run_optimization_with_retries(excel_path: str, parent_block_sizes: List[List[float]] = None,
-                                   buffer: float = 2, max_tries: int = 10000) -> Tuple[People_helper, Dict]:
+                                   buffer: float = 2, max_tries: int = 10000,
+                                   parent_block_quantities: List[Optional[int]] = None,
+                                   recovered_stock: List[Dict[str, Any]] = None,
+                                   search_attempts: int = None) -> Tuple[People_helper, Dict]:
     """
     Run optimization with multiple retries to find best solution
-    
+
     Args:
         excel_path: Path to Excel file
         parent_block_sizes: Stock block dimensions
         buffer: Spacing between parts
         max_tries: Maximum retry attempts
-    
+        parent_block_quantities: Units available per parent size, parallel to
+            parent_block_sizes; None entries mean unlimited
+        recovered_stock: Inventory offcuts to pack into before opening stock
+        search_attempts: How many legal packings to generate before returning the best.
+            Default 1 (return the first legal one, the historical behaviour), raised to 5
+            when quotas or recovered stock are in play - there, what fits varies genuinely
+            between attempts because supply is finite, so first-legal under-performs.
+
     Returns:
         (helper, block_details) tuple
     """
     if parent_block_sizes is None:
         parent_block_sizes = [[1870, 800, 350], [2000, 800, 400]]
-    
+
+    constrained = bool(recovered_stock) or any(
+        q is not None for q in (parent_block_quantities or []))
+    if search_attempts is None:
+        search_attempts = 5 if constrained else 1
+    search_attempts = max(1, int(search_attempts))
+
     tried = 0
     last_error = None
     same_error_count = 0
+
+    best = None  # (parts_packed, -new_material_volume, helper, block_details)
+    legal_found = 0
 
     while tried <= max_tries:
         try:
@@ -1170,15 +1465,27 @@ def run_optimization_with_retries(excel_path: str, parent_block_sizes: List[List
             # Sort by volume (largest first)
             prism_list_sorted = sorted(all_prisms, key=lambda p: p.get_volume(), reverse=True)
 
+            # No-op unless a deep run has set a seed, so the ordinary path is unchanged.
+            prism_list_sorted = perturb_prism_order(prism_list_sorted, PRISM_ORDER_SEED)
+
             # Run packing
-            helper = run_final_code(prism_list_sorted, buffer=buffer, parent_block_sizes=parent_block_sizes)
+            helper = run_final_code(prism_list_sorted, buffer=buffer,
+                                    parent_block_sizes=parent_block_sizes,
+                                    parent_block_quantities=parent_block_quantities,
+                                    recovered_stock=recovered_stock)
 
             # Get results
             block_details = get_block_details(helper)
 
             if block_details is not None and helper is not None:
-                # Check if any block has >= 99% efficiency (too good to be true)
-                has_perfect_block = any(obj['eff'] >= 99 for obj in block_details['blocks'])
+                # Check if any new block has >= 99% efficiency (too good to be true).
+                # Recovered blocks are excluded: an offcut is often barely larger than the
+                # part cut from it, so a near-perfect fill is the normal case there. Judging
+                # them by this rule rejects every attempt of any run that offers inventory,
+                # exhausting max_tries and returning nothing.
+                has_perfect_block = any(
+                    obj['eff'] >= 99 for obj in block_details['blocks']
+                    if not obj.get('is_recovered'))
 
                 # Never return a packing where prisms interpenetrate - it cannot be cut.
                 overlaps = find_overlaps(helper)
@@ -1187,7 +1494,21 @@ def run_optimization_with_retries(excel_path: str, parent_block_sizes: List[List
                           f"(e.g. {overlaps[0]})")
 
                 if not has_perfect_block and not overlaps:
-                    return helper, block_details
+                    if search_attempts == 1:
+                        return helper, block_details
+
+                    # Best-of-N: most parts placed, then least new material bought.
+                    packed = sum(p['number'] for b in block_details['blocks']
+                                 for p in b['prisms'])
+                    score = (packed, -block_details['Total_stock_volume'])
+                    if best is None or score > best[0]:
+                        best = (score, helper, block_details)
+
+                    legal_found += 1
+                    if legal_found >= search_attempts:
+                        print(f"Returning best of {legal_found} legal packings: "
+                              f"{best[0][0]} parts, {-best[0][1]:.0f} mm^3 new material")
+                        return best[1], best[2]
 
             tried += 1
 
@@ -1211,3 +1532,9 @@ def run_optimization_with_retries(excel_path: str, parent_block_sizes: List[List
             if tried == max_tries:
                 print('Max tries exceeded')
                 raise
+
+    # Retries exhausted. Under best-of-N a legal packing may already be in hand - returning
+    # it beats discarding it and letting the caller raise "optimization failed".
+    if best is not None:
+        print(f"Max tries exceeded; returning best of {legal_found} legal packings")
+        return best[1], best[2]

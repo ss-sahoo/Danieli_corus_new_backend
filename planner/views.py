@@ -459,6 +459,55 @@ from .serializers import (
     Top3ConfigurationsResponseSerializer,
 )
 from .services import get_cutting_service
+from .run_summary import build_summary, layout_signature, stock_sizes_from, summary_for_history
+
+
+# ============================================================
+# CACHE HELPERS
+# ============================================================
+# The cache is a Redis instance holding the pickled People_helper so the visualization
+# endpoints can read it back. It is a convenience, not the record: every run is also
+# persisted to OptimizationHistory and pickled to MEDIA_ROOT/helpers/<id>.pkl, and
+# get_helper_for_job falls back to that file.
+#
+# django-redis raises on a connection failure rather than degrading, so an unguarded
+# cache.set turns a finished optimization into a 500 and throws the whole run away -
+# minutes of packing lost, no history row written, because a cache was unreachable.
+# Route writes and reads that must not do that through these.
+
+def cache_set_safe(key, value, timeout=None, label=None):
+    """Write to the cache; on failure log and carry on. Returns True when it landed."""
+    try:
+        from django.core.cache import cache
+        cache.set(key, value, timeout=timeout)
+        return True
+    except Exception as e:
+        print(f"[CACHE] Could not write {label or key}: {e}")
+        print(f"[CACHE] Continuing - the result is still saved to history and disk. "
+              f"Visualizations may need a job_id until the cache is reachable.")
+        return False
+
+
+def cache_get_safe(key, default=None, label=None):
+    """Read from the cache; on failure return default rather than raising."""
+    try:
+        from django.core.cache import cache
+        return cache.get(key)
+    except Exception as e:
+        print(f"[CACHE] Could not read {label or key}: {e}")
+        return default
+
+
+def cache_delete_safe(key, label=None):
+    """Evict a stale entry; on failure log and carry on."""
+    try:
+        from django.core.cache import cache
+        cache.delete(key)
+        return True
+    except Exception as e:
+        print(f"[CACHE] Could not evict {label or key}: {e}")
+        return False
+
 
 # Import from your new modules
 try:
@@ -672,7 +721,9 @@ def download_block_visualization(request, block_code):
         from django.core.cache import cache
         import zipfile, io
 
-        helper = cache.get("latest_helper")
+        # Safe read: with the cache unreachable this reports "not ready" like an expired
+        # entry, rather than a 500 with a Redis traceback.
+        helper = cache_get_safe("latest_helper", label="latest_helper")
         if helper is None:
             return Response({"success": False, "error": "Optimization data not ready."}, status=400)
 
@@ -860,11 +911,13 @@ def view_all_blocks(request):
 def get_helper_for_job(job_id, cache):
     helper = None
     if not job_id:
-        helper = cache.get("latest_helper")
+        # No job_id means "whatever ran last", which only the cache knows. With the cache
+        # down there is nothing to fall back to, so the caller reports "not ready" rather
+        # than surfacing a Redis traceback; passing a job_id works via the disk pickle.
+        helper = cache_get_safe("latest_helper", label="latest_helper")
     else:
-        from django.core.cache import cache as django_cache
         helper_cache_key = f"helper_objs_{job_id}"
-        cached_helper = django_cache.get(helper_cache_key)
+        cached_helper = cache_get_safe(helper_cache_key, label=helper_cache_key)
         if cached_helper is not None:
             helper = cached_helper
         else:
@@ -877,7 +930,8 @@ def get_helper_for_job(job_id, cache):
                 if os.path.exists(pkl_path):
                     with open(pkl_path, "rb") as f:
                         helper = pickle.load(f)
-                    django_cache.set(helper_cache_key, helper, timeout=1800)
+                    cache_set_safe(helper_cache_key, helper, timeout=1800,
+                                   label=helper_cache_key)
                     print(f"[GET_HELPER] Successfully loaded pickled helper from disk for job_id={job_id}")
             except Exception as e:
                 print(f"[GET_HELPER] Failed to load pickled helper for job {job_id}: {e}")
@@ -890,7 +944,12 @@ def get_helper_for_job(job_id, cache):
                     parts_data = history.uploaded_file_data
                     buffer_spacing = history.parameters.get('buffer_spacing', 2)
                     parent_block_sizes = history.parameters.get('parent_blocks_used', [])
-                    
+                    # Supply constraints have to be replayed too, or the reconstruction packs
+                    # against unlimited stock and no scrap, producing a layout that does not
+                    # match the plan whose visualization is being requested.
+                    parent_block_quantities = history.parameters.get('parent_block_quantities')
+                    recovered_stock = history.parameters.get('recovered_stock') or []
+
                     all_prisms = []
                     for part in parts_data:
                         bottom_len = part.get('Bottom Length', part.get('bottom_length', 0))
@@ -904,12 +963,16 @@ def get_helper_for_job(job_id, cache):
                         all_prisms.append(Prisms(mark, size, int(nos)))
                         
                     prism_list_sorted = sorted(all_prisms, key=lambda p: p.get_volume(), reverse=True)
-                    helper = run_final_code(prism_list_sorted, buffer=buffer_spacing, parent_block_sizes=parent_block_sizes)
-                    
-                    django_cache.set(helper_cache_key, helper, timeout=1800)
+                    helper = run_final_code(prism_list_sorted, buffer=buffer_spacing,
+                                            parent_block_sizes=parent_block_sizes,
+                                            parent_block_quantities=parent_block_quantities,
+                                            recovered_stock=recovered_stock)
+
+                    cache_set_safe(helper_cache_key, helper, timeout=1800,
+                                   label=helper_cache_key)
                 except Exception as e:
                     print(f"[GET_HELPER] Error reconstructing helper for job {job_id}: {e}")
-                    helper = cache.get("latest_helper")
+                    helper = cache_get_safe("latest_helper", label="latest_helper")
 
     if helper:
         for b in helper.all_big_blocks:
@@ -941,11 +1004,14 @@ def generate_block_visualization(request, block_code):
                 break
         
         if block is None:
-            # Try by index
+            # Try by index. Only B-codes are positional; an R-code is a recovered block
+            # whose number comes from its own counter, so indexing all_big_blocks with it
+            # would return an unrelated block (and int('R1'[1:]) is not the same series).
             try:
-                block_index = int(block_code.replace("B", "")) - 1
-                if 0 <= block_index < len(helper.all_big_blocks):
-                    block = helper.all_big_blocks[block_index]
+                if block_code.startswith('B'):
+                    block_index = int(block_code.replace("B", "")) - 1
+                    if 0 <= block_index < len(helper.all_big_blocks):
+                        block = helper.all_big_blocks[block_index]
             except:
                 pass
         
@@ -1131,7 +1197,23 @@ def upload_and_optimize(request):
         buffer_spacing = float(request.POST.get('buffer_spacing', '2.0'))
         max_retries = int(request.POST.get('max_retries', '5000'))
         retry_enabled = request.POST.get('retry_enabled', 'true').lower() == 'true'
-        
+
+        # Supply stage 1 controls: cut racked offcuts before opening new stock.
+        # Off by default, so a client that does not send these behaves exactly as before.
+        use_scrap_inventory = str(
+            request.POST.get('use_scrap_inventory', 'false')
+        ).strip().lower() in ('true', '1', 'yes')
+        scrap_inventory_ids_json = request.POST.get('scrap_inventory_ids', '')
+
+        # How many legal packings to generate before keeping the best. Blank = let the
+        # engine decide (1 unconstrained, 5 when supply is limited and outcomes vary).
+        search_attempts_raw = str(request.POST.get('search_attempts', '')).strip()
+        try:
+            search_attempts = int(search_attempts_raw) if search_attempts_raw else None
+        except ValueError:
+            print(f"Warning: invalid search_attempts {search_attempts_raw!r}, using default")
+            search_attempts = None
+
         try:
             selected_blocks = json.loads(selected_blocks_json)
             parent_blocks_data = json.loads(parent_blocks_json)
@@ -1140,7 +1222,15 @@ def upload_and_optimize(request):
                 'success': False,
                 'error': f'Invalid JSON in parameters: {str(e)}'
             }, status=400)
-        
+
+        scrap_inventory_ids = None
+        if scrap_inventory_ids_json.strip():
+            try:
+                scrap_inventory_ids = [int(v) for v in json.loads(scrap_inventory_ids_json)]
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                print(f"Warning: invalid scrap_inventory_ids, offering whole inventory: {e}")
+                scrap_inventory_ids = None
+
         print(f"File: {excel_file.name} ({(excel_file.size/1024):.2f} KB)")
         print(f"Selected blocks: {len(selected_blocks)} items")
         print(f"Parent blocks data count: {len(parent_blocks_data)}")
@@ -1153,13 +1243,17 @@ def upload_and_optimize(request):
         # ====================
         parent_block_sizes = []
         parent_labels = []
-        
+        # Units of each size on hand, parallel to parent_block_sizes. None = unlimited,
+        # which is what an entry without a quantity means and what every existing client
+        # sends, so the default path is unchanged.
+        parent_quantities = []
+
         if not parent_blocks_data:
             return Response({
                 'success': False,
                 'error': 'No parent blocks provided'
             }, status=400)
-        
+
         for i, block in enumerate(parent_blocks_data):
             try:
                 if isinstance(block, dict):
@@ -1192,26 +1286,83 @@ def upload_and_optimize(request):
                     print(f"Warning: Parent block {i} has non-positive dimensions: {length}x{width}x{height}")
                     continue
                 
+                # Optional stock limit. Only the dict shapes carry it; a bare [l, w, h]
+                # stays unlimited. Absent, null or unparseable all mean unlimited rather
+                # than rejecting the run, matching the forgiving style of this parser.
+                quantity = None
+                if isinstance(block, dict) and block.get('quantity') is not None:
+                    try:
+                        quantity = int(block['quantity'])
+                        if quantity <= 0:
+                            print(f"Warning: Parent block {i} has non-positive quantity "
+                                  f"{block['quantity']}, skipping this size")
+                            continue
+                    except (TypeError, ValueError):
+                        print(f"Warning: Parent block {i} has invalid quantity "
+                              f"{block['quantity']!r}, treating as unlimited")
+                        quantity = None
+
                 # Add to lists
                 parent_block_sizes.append([length, width, height])
                 label = block.get('label', f'{length}×{width}×{height}') if isinstance(block, dict) else f'{length}×{width}×{height}'
                 parent_labels.append(label)
-                
-                print(f"Added parent block: {label} = [{length}, {width}, {height}]")
-                
+                parent_quantities.append(quantity)
+
+                print(f"Added parent block: {label} = [{length}, {width}, {height}]"
+                      f" (qty: {'unlimited' if quantity is None else quantity})")
+
             except Exception as e:
                 print(f"Error processing parent block {i}: {e}")
                 continue
-        
+
         if not parent_block_sizes:
             return Response({
                 'success': False,
                 'error': 'No valid parent blocks provided'
             }, status=400)
-        
+
         print(f"Parent block sizes to use: {parent_block_sizes}")
         print(f"Parent block labels: {parent_labels}")
-        
+        print(f"Parent block quantities: {parent_quantities}")
+
+        # ====================
+        # 2b. COLLECT RECOVERED SCRAP (supply stage 1)
+        # ====================
+        # Offcuts racked from previous jobs. These are packed into before any stock is
+        # opened, so every part they absorb is a part no new block has to be bought for.
+        recovered_stock = []
+        scrap_inventory_offered = 0
+
+        if use_scrap_inventory:
+            try:
+                from .models import ScrapInventory
+
+                # 'manual' rows are real offcuts a user entered by hand; 'usable' ones came
+                # out of an executed run. Both are physically on the rack, unlike 'unusable'.
+                inv_qs = ScrapInventory.objects.filter(
+                    is_in_inventory=True,
+                    usability__in=['usable', 'manual']
+                )
+                if scrap_inventory_ids is not None:
+                    inv_qs = inv_qs.filter(id__in=scrap_inventory_ids)
+
+                for s in inv_qs:
+                    recovered_stock.append({
+                        'id': s.id,
+                        'scrap_id': s.scrap_id,
+                        'size': [float(s.length), float(s.width), float(s.height)],
+                    })
+
+                scrap_inventory_offered = len(recovered_stock)
+                print(f"Scrap inventory: offering {scrap_inventory_offered} racked pieces")
+
+            except Exception as e:
+                # Non-fatal: a run without recovered stock is still a valid run, it just
+                # buys more material than it needed to.
+                print(f"Error loading scrap inventory (non-critical): {e}")
+                recovered_stock = []
+                scrap_inventory_offered = 0
+
         # ====================
         # 3. PROCESS EXCEL FILE
         # ====================
@@ -1375,9 +1526,12 @@ def upload_and_optimize(request):
                     excel_path=temp_file_path,
                     parent_block_sizes=parent_block_sizes,
                     buffer=buffer_spacing,
-                    max_tries=max_retries
+                    max_tries=max_retries,
+                    parent_block_quantities=parent_quantities,
+                    recovered_stock=recovered_stock,
+                    search_attempts=search_attempts
                 )
-                
+
                 print(f"Optimization completed after retries")
                 
             else:
@@ -1419,9 +1573,11 @@ def upload_and_optimize(request):
                 helper = run_final_code(
                     all_prisms=prism_list_sorted,
                     buffer=buffer_spacing,
-                    parent_block_sizes=parent_block_sizes
+                    parent_block_sizes=parent_block_sizes,
+                    parent_block_quantities=parent_quantities,
+                    recovered_stock=recovered_stock
                 )
-                
+
                 if helper is None:
                     raise Exception("Packing algorithm returned None")
                 
@@ -1439,14 +1595,16 @@ def upload_and_optimize(request):
             for b in helper.all_big_blocks:
                 b.parent_helper = helper
             
-            # Store helper in cache for visualization
-            cache.set(
+            # Store helper in cache for visualization. Non-fatal: the packing is done and
+            # about to be written to history and pickled to disk, so a cache outage must
+            # not discard it.
+            cache_set_safe(
                 "latest_helper",
                 helper,
-                timeout=60 * 60 * 24 * 7  # 2 hours
+                timeout=60 * 60 * 24 * 7,
+                label="latest_helper"
             )
-            # print(f"Cached helper for visualizations.")
-            
+
         except Exception as e:
             print(f"ERROR in optimization: {str(e)}")
             traceback.print_exc()
@@ -1484,15 +1642,25 @@ def upload_and_optimize(request):
             if block_details is None:
                 block_details = get_block_details(helper)
             
+            # A recovered block is a racked offcut, not stock this job bought. Efficiency
+            # answers "how well did we use what we bought", so it and every volume feeding
+            # it are computed over new blocks only. Both the stock term and the prism term
+            # have to be restricted together - restricting only the denominator pushes
+            # efficiency past 100% as soon as most parts come out of scrap.
+            new_blocks = [b for b in helper.all_big_blocks if not getattr(b, 'is_recovered', False)]
+            recovered_blocks = [b for b in helper.all_big_blocks if getattr(b, 'is_recovered', False)]
+            recovered_codes = {b.unique_code for b in recovered_blocks}
+
             # Calculate totals
             total_parts_packed = 0
-            total_prism_volume = 0
+            total_prism_volume = 0       # parts cut from newly bought stock
+            recovered_prism_volume = 0   # parts cut from racked offcuts - material saved
             total_requested = 0
-            
+
             # Calculate total requested from parts_data
             for part in parts_data:
                 total_requested += part['Nos']
-            
+
             # Calculate packed parts and volumes from block_details
             if block_details and 'blocks' in block_details:
                 for block in block_details['blocks']:
@@ -1502,31 +1670,46 @@ def upload_and_optimize(request):
                             for part in parts_data:
                                 if part['MARK'] == prism_info['code']:
                                     prism_volume = 0.5 * (part['Bottom Length'] + part['Top Length']) * part['Width'] * part['Height']
-                                    total_parts_packed += prism_info.get('number', 0)
-                                    total_prism_volume += prism_volume * prism_info.get('number', 0)
+                                    count = prism_info.get('number', 0)
+                                    total_parts_packed += count
+                                    if block.get('code') in recovered_codes:
+                                        recovered_prism_volume += prism_volume * count
+                                    else:
+                                        total_prism_volume += prism_volume * count
                                     break
-            
+
             print(f"Packing summary:")
             print(f"- Total parts requested: {total_requested}")
             print(f"- Total parts packed: {total_parts_packed}")
             print(f"- Packing rate: {(total_parts_packed/total_requested*100 if total_requested > 0 else 0):.2f}%")
-            
-            # Calculate total stock volume
+
+            # Calculate total stock volume (newly bought material only)
             total_stock_volume = 0
-            for block in helper.all_big_blocks:
+            for block in new_blocks:
                 total_stock_volume += block.volume
-            
+
+            recovered_volume_used = sum(b.volume for b in recovered_blocks)
+
             # Calculate efficiency
             if total_stock_volume > 0:
                 efficiency = (total_prism_volume / total_stock_volume) * 100
             else:
                 efficiency = 0
-            
-            print(f"- Total stock volume: {total_stock_volume:.2f}")
-            print(f"- Total prism volume: {total_prism_volume:.2f}")
-            print(f"- Efficiency: {efficiency:.2f}%")
+
+            # How well all material in play was used, bought and recovered together.
+            if (total_stock_volume + recovered_volume_used) > 0:
+                overall_efficiency = ((total_prism_volume + recovered_prism_volume) /
+                                      (total_stock_volume + recovered_volume_used)) * 100
+            else:
+                overall_efficiency = 0
+
+            print(f"- New blocks: {len(new_blocks)}, recovered blocks: {len(recovered_blocks)}")
+            print(f"- Total stock volume (new): {total_stock_volume:.2f}")
+            print(f"- Total prism volume (from new): {total_prism_volume:.2f}")
+            print(f"- Material saved from scrap: {recovered_prism_volume:.2f}")
+            print(f"- Efficiency: {efficiency:.2f}% (overall {overall_efficiency:.2f}%)")
             print(f"- Optimization duration: {optimization_duration:.2f} seconds")
-            
+
             # Prepare detailed block information
             blocks_info = []
             for block in helper.all_big_blocks:
@@ -1546,12 +1729,63 @@ def upload_and_optimize(request):
                         'efficiency': float(block.get_efficiency()),
                         'prisms': prism_list,
                         'volume': float(block.volume),
-                        'start_coord': [float(coord) for coord in block.start_coord]
+                        'start_coord': [float(coord) for coord in block.start_coord],
+                        # Fingerprint of the cut layout, stored so the summary can count
+                        # distinct saw setups later without re-reading the pickled helper.
+                        'pattern_key': layout_signature(block),
+                        # An R-block is an offcut off the rack, not stock to buy. The UI
+                        # needs to tell the two apart - they are different instructions to
+                        # the shop floor.
+                        'is_recovered': bool(getattr(block, 'is_recovered', False)),
+                        'source_scrap_id': getattr(block, 'source_scrap_id', None)
                     })
                 except Exception as e:
                     print(f"Error processing block {block.unique_code}: {e}")
                     continue
-            
+
+            # ---- Stock ledger: what each parent size was allowed and what it cost ----
+            stock_usage = []
+            for idx, size in enumerate(parent_block_sizes):
+                used = sum(1 for b in new_blocks if getattr(b, 'size_index', None) == idx)
+                allowed = parent_quantities[idx] if idx < len(parent_quantities) else None
+                stock_usage.append({
+                    'index': idx,
+                    'label': parent_labels[idx] if idx < len(parent_labels) else None,
+                    'dimensions': [float(d) for d in size],
+                    'quantity_allowed': allowed,
+                    'quantity_used': used,
+                    'quantity_remaining': None if allowed is None else max(0, allowed - used),
+                })
+
+            # ---- Which racked offcuts this plan actually cuts into ----
+            scrap_inventory_used = []
+            for block in recovered_blocks:
+                prism_counts = {}
+                for entry in block.prism_details:
+                    prism = entry['prism']
+                    prism_counts[prism.code] = prism_counts.get(prism.code, 0) + len(entry['coordinates'])
+
+                scrap_inventory_used.append({
+                    'inventory_id': getattr(block, 'source_inventory_id', None),
+                    'scrap_id': getattr(block, 'source_scrap_id', None),
+                    'block_code': block.unique_code,
+                    'dimensions': [float(d) for d in block.size],
+                    'volume': float(block.volume),
+                    'parts': [{'code': c, 'count': n} for c, n in prism_counts.items()],
+                    'utilisation': round(float(block.get_efficiency()), 2),
+                })
+
+            # Only pieces that received a part are consumed; prune_unused_recovered_blocks
+            # has already dropped the rest, so recovered_blocks is exactly the consumed set.
+            consumed_scrap_inventory_ids = [
+                e['inventory_id'] for e in scrap_inventory_used if e['inventory_id'] is not None
+            ]
+
+            has_stock_exhausted = any(
+                r == 'stock_exhausted'
+                for r in getattr(helper, 'shortfall_reasons', {}).values()
+            )
+
             # Prepare scrap information
             scraps_info = []
             for scrap in helper.all_scrap:
@@ -1578,12 +1812,15 @@ def upload_and_optimize(request):
             # The packer tries all six orientations, so "fits in some orientation" reduces
             # to comparing sorted dimensions. Clearance is included because fill_the_box
             # offsets the first part by the buffer on every axis.
-            def which_parents_fit(part):
-                need = sorted([
+            def part_envelope(part):
+                return sorted([
                     float(part['Bottom Length']) + buffer_spacing,
                     float(part['Width']) + buffer_spacing,
                     float(part['Height']) + buffer_spacing,
                 ])
+
+            def which_parents_fit(part):
+                need = part_envelope(part)
                 fitting = []
                 for idx, size in enumerate(parent_block_sizes):
                     have = sorted([float(d) for d in size])
@@ -1595,8 +1832,30 @@ def upload_and_optimize(request):
                         })
                 return fitting
 
+            def which_scraps_fit(part):
+                """
+                Offered inventory pieces this part fits in.
+
+                Reported separately because a part can fit no parent block yet still be cut
+                from a racked offcut. Without this the row would read
+                'does_not_fit_any_parent_block' while showing packed > 0 - self-contradictory.
+                """
+                need = part_envelope(part)
+                fitting = []
+                for piece in recovered_stock:
+                    have = sorted([float(d) for d in piece['size']])
+                    if all(n <= h for n, h in zip(need, have)):
+                        fitting.append({
+                            'inventory_id': piece['id'],
+                            'scrap_id': piece['scrap_id'],
+                            'dimensions': [float(d) for d in piece['size']],
+                        })
+                return fitting
+
             def name_of(fit):
                 return fit['label'] or '{:g}x{:g}x{:g}'.format(*fit['dimensions'])
+
+            shortfall_reasons = getattr(helper, 'shortfall_reasons', {}) or {}
 
             prism_summary = []
             unpackable_parts = []
@@ -1611,13 +1870,28 @@ def upload_and_optimize(request):
 
                 remaining = max(0, part['Nos'] - packed_count)
                 fits_in = which_parents_fit(part)
+                fits_scrap = which_scraps_fit(part)
                 placeable = len(fits_in) > 0
                 fit_names = ', '.join(name_of(f) for f in fits_in)
 
                 if remaining == 0:
                     status = 'packed'
                     reason = None
-                elif not placeable:
+                elif shortfall_reasons.get(part['MARK']) == 'stock_exhausted':
+                    # Checked before 'not placeable': the part is fine and so is the size
+                    # choice, there is simply none of that stock left. Deliberately worded
+                    # without "does not fit" - that phrasing is reserved for the branch
+                    # below, and confusing the two sends the user to change the part when
+                    # they only need to raise a quantity.
+                    status = 'stock_exhausted'
+                    reason = (
+                        "{} fits {}, but every available block of {} was used. Increase the "
+                        "quantity, add another stock size, or supply more scrap.".format(
+                            part['MARK'],
+                            fit_names or 'the available scrap',
+                            'that size' if len(fits_in) == 1 else 'those sizes')
+                    )
+                elif not placeable and not fits_scrap:
                     status = 'does_not_fit_any_parent_block'
                     reason = (
                         "{} is {:g}x{:g}x{:g} mm and, with {:g} mm clearance, is larger than "
@@ -1625,6 +1899,16 @@ def upload_and_optimize(request):
                         "size or reduce the part.".format(
                             part['MARK'], float(part['Bottom Length']), float(part['Width']),
                             float(part['Height']), float(buffer_spacing))
+                    )
+                elif not placeable:
+                    # Fits no bought size but does fit an offered offcut, so it is cuttable
+                    # from what is on the rack - a warning, not a dead end.
+                    status = 'not_placed' if packed_count == 0 else 'partially_placed'
+                    reason = (
+                        "{} fits no selected parent block, but does fit {} offered scrap "
+                        "piece{}. {} of {} could not be placed.".format(
+                            part['MARK'], len(fits_scrap),
+                            '' if len(fits_scrap) == 1 else 's', remaining, part['Nos'])
                     )
                 elif packed_count == 0:
                     status = 'not_placed'
@@ -1646,8 +1930,9 @@ def upload_and_optimize(request):
                     'height': part['Height'],
                     'volume': 0.5 * (part['Bottom Length'] + part['Top Length']) * part['Width'] * part['Height'],
                     'packing_rate': (packed_count / part['Nos'] * 100) if part['Nos'] > 0 else 0,
-                    'placeable': placeable,
+                    'placeable': placeable or len(fits_scrap) > 0,
                     'fits_parent_blocks': fits_in,
+                    'fits_scrap_inventory': fits_scrap,
                     'status': status,
                     'reason': reason
                 })
@@ -1662,13 +1947,17 @@ def upload_and_optimize(request):
                         'height': part['Height'],
                         'reason': reason
                     })
-                elif status in ('not_placed', 'partially_placed'):
+                elif status in ('not_placed', 'partially_placed', 'stock_exhausted'):
+                    # stock_exhausted is a warning class like the other two: the part fits,
+                    # so it never belongs in unpackable_parts.
                     unplaced_parts.append({
                         'code': part['MARK'],
                         'requested': part['Nos'],
                         'packed': packed_count,
                         'remaining': remaining,
                         'fits_parent_blocks': fits_in,
+                        'fits_scrap_inventory': fits_scrap,
+                        'status': status,
                         'reason': reason
                     })
 
@@ -1693,7 +1982,62 @@ def upload_and_optimize(request):
             total_parts_packed = 0
             total_requested = sum(part['Nos'] for part in parts_data)
             efficiency = 0
-        
+            overall_efficiency = 0
+            recovered_prism_volume = 0
+            recovered_volume_used = 0
+            new_blocks = []
+            recovered_blocks = []
+            stock_usage = []
+            scrap_inventory_used = []
+            consumed_scrap_inventory_ids = []
+            has_stock_exhausted = False
+
+        # ====================
+        # 6b. RUN SUMMARY (for the person doing the cutting)
+        # ====================
+        # Aggregates only - what stock to pull, how many saw setups, how many offcuts to
+        # rack, and the settings the run used. Per-block detail stays in 'blocks'/'scraps'.
+        stock_sizes_selected = stock_sizes_from(parent_block_sizes, parent_labels)
+
+        scrap_inventory_enabled = use_scrap_inventory
+
+        # Only inventory pieces are kept: a scrap generated during this run sits inside a
+        # stock block that is already counted, and the list of those runs to thousands.
+        consumed_from_inventory = [
+            c for c in getattr(helper, 'consumed_scraps', [])
+            if c.get('origin') == 'inventory'
+        ]
+
+        # build_summary counts every block it is given as stock to pull. Recovered blocks
+        # are offcuts already on the rack, so passing them would put steel on the pull list
+        # that nobody has to fetch, and add an unlabelled size entry per offcut. They are
+        # reported instead through consumed_scraps, as scrap_pieces_used.
+        new_blocks_info = [b for b in blocks_info if not b.get('is_recovered')]
+
+        try:
+            run_summary = build_summary(
+                blocks=new_blocks_info,
+                scraps=scraps_info,
+                prism_summary=prism_summary,
+                stock_sizes=stock_sizes_selected,
+                blade_thickness=buffer_spacing,
+                source_file=excel_file.name,
+                run_by=request.user.username,
+                run_at=timezone.now().isoformat(),
+                scrap_inventory_enabled=scrap_inventory_enabled,
+                consumed_scraps=consumed_from_inventory,
+            )
+            print(f"- Stock pulled: " + ", ".join(
+                f"{s['quantity']}x {s['label'] or 'unlabelled'}"
+                for s in run_summary['stock_used']['by_size']))
+            print(f"- Distinct cutting patterns: {run_summary['cutting']['distinct_patterns']}")
+            print(f"- Offcuts: {run_summary['offcuts']['to_rack']} to rack, "
+                  f"{run_summary['offcuts']['to_discard']} to discard")
+        except Exception as e:
+            print(f"Error building run summary (non-critical): {e}")
+            traceback.print_exc()
+            run_summary = None
+
         # ====================
         # 7. SAVE TO HISTORY
         # ====================
@@ -1727,7 +2071,12 @@ def upload_and_optimize(request):
                         'optimization_duration_seconds': round(optimization_duration, 2)
                     }
                 }
-                
+                # Merged into the existing summary rather than parked under a new key, so
+                # the history page finds the new sections next to the totals it already
+                # reads. No key overlaps with the ones above.
+                if run_summary:
+                    optimization_results['summary'].update(run_summary)
+
                 # Save to history
                 history = OptimizationHistory.objects.create(
                     user=request.user,
@@ -1744,11 +2093,22 @@ def upload_and_optimize(request):
                         'retry_enabled': retry_enabled,
                         'original_part_count': original_part_count,
                         'filtered_part_count': len(parts_data),
-                        'optimization_duration_seconds': optimization_duration
+                        'optimization_duration_seconds': optimization_duration,
+                        # Kept so the summary can be rebuilt from the row alone
+                        'scrap_inventory_enabled': scrap_inventory_enabled,
+                        'consumed_scraps': consumed_from_inventory,
+                        # Needed to reproduce this exact plan: get_helper_for_job re-runs
+                        # run_final_code from these values, and a reconstruction without
+                        # them would pack against different supply than the saved plan.
+                        'parent_block_quantities': parent_quantities,
+                        'stock_usage': stock_usage,
+                        'recovered_stock': recovered_stock,
+                        # Read on execute to retire the racked pieces this job cuts up.
+                        'consumed_scrap_inventory_ids': consumed_scrap_inventory_ids
                     },
                     optimization_results=optimization_results,
                     efficiency=round(efficiency, 2),
-                    total_blocks_created=len(helper.all_big_blocks),
+                    total_blocks_created=len(new_blocks),
                     total_parts_packed=total_parts_packed,
                     total_parts_requested=total_requested,
                     prism_summary=prism_summary
@@ -1830,10 +2190,21 @@ def upload_and_optimize(request):
         # otherwise a shortfall is only discoverable by scanning prism_summary by hand.
         summary_message = (
             f'Successfully packed {total_parts_packed} out of {total_requested} parts '
-            f'({total_parts_packed/total_requested*100:.1f}%) into {len(helper.all_big_blocks)} '
+            f'({total_parts_packed/total_requested*100:.1f}%) into {len(new_blocks)} '
             f'stock blocks with {efficiency:.2f}% efficiency in {optimization_duration:.2f} seconds.'
             if total_requested > 0 else 'No parts to pack.'
         )
+        if recovered_blocks:
+            summary_message += (
+                ' {} racked scrap piece{} reused, saving {:.0f} mm³ of new material.'.format(
+                    len(recovered_blocks), '' if len(recovered_blocks) == 1 else 's',
+                    recovered_prism_volume)
+            )
+        if has_stock_exhausted:
+            summary_message += (
+                ' Some parts were left short because the available stock ran out, '
+                'not because they are too large.'
+            )
         if unpackable_parts:
             summary_message += (
                 ' {} part type{} ({}) do{} not fit any selected parent block and could not be '
@@ -1855,14 +2226,37 @@ def upload_and_optimize(request):
             'total_parts_packed': total_parts_packed,
             'total_parts_requested': total_requested,
             'packing_percentage': round(total_parts_packed / total_requested * 100, 2) if total_requested > 0 else 0,
-            'total_blocks_created': len(helper.all_big_blocks),
+            # New stock only. A recovered block is material already on the rack, so counting
+            # it here would report the job as buying blocks it did not buy.
+            'total_blocks_created': len(new_blocks),
             'total_stock_volume': round(total_stock_volume, 2),
             'total_prism_volume': round(total_prism_volume, 2),
             'waste_percentage': round(100 - efficiency, 2),
+            # Recovered-material view. overall_efficiency counts bought and racked material
+            # together, material_saved_volume is the part volume that came out of scrap and
+            # is the headline number for the reuse feature.
+            'total_recovered_blocks': len(recovered_blocks),
+            'recovered_volume_used': round(recovered_volume_used, 2),
+            'material_saved_volume': round(recovered_prism_volume, 2),
+            'overall_efficiency': round(overall_efficiency, 2),
             'blocks': blocks_info,
             'scraps': scraps_info,
             'parent_blocks_used': parent_block_sizes,
             'parent_labels': parent_labels,
+            'parent_block_quantities': parent_quantities,
+            # Per-size ledger: what was allowed, what the plan spent, what is left.
+            'stock_usage': stock_usage,
+            # Racked offcuts this plan cuts into, and how many were on offer.
+            'scrap_inventory_used': scrap_inventory_used,
+            'scrap_inventory_offered': scrap_inventory_offered,
+            'scrap_inventory_enabled': scrap_inventory_enabled,
+            # True when a part was left short purely because stock ran out. Distinct from
+            # has_unpackable_parts: this one is fixed by raising a quantity, not by
+            # choosing a bigger size.
+            'has_stock_exhausted': has_stock_exhausted,
+            # Shop-floor view of the run: stock to pull, parts produced, offcuts to rack,
+            # saw setups, and the settings used. Aggregates only.
+            'summary': run_summary,
             'prism_summary': prism_summary,
             # Parts no selected stock size can hold in any orientation. Non-empty means the
             # user must change the stock selection - re-running will not help.
@@ -1875,6 +2269,9 @@ def upload_and_optimize(request):
                 'buffer_spacing': buffer_spacing,
                 'max_retries': max_retries,
                 'retry_enabled': retry_enabled,
+                'use_scrap_inventory': use_scrap_inventory,
+                'scrap_inventory_ids': scrap_inventory_ids,
+                'search_attempts': search_attempts,
                 'optimization_duration_seconds': round(optimization_duration, 2)
             },
             'history_saved': history_saved,
@@ -1925,6 +2322,379 @@ def upload_and_optimize(request):
             'error': f"Optimization failed: {str(e)}",
             'traceback': traceback.format_exc() if settings.DEBUG else None
         }, status=500)
+
+
+# ================================
+# DEEP OPTIMIZATION
+# ================================
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def upload_and_optimize_deep(request):
+    """
+    POST /api/upload-optimize-deep/
+
+    The slow, thorough sibling of /api/upload-optimize/. Same payload, same response,
+    plus a 'deep_search' section describing what it explored.
+
+    It does two things the quick endpoint does not:
+
+    1. Searches over SUBSETS of the offered parent sizes instead of handing all of them
+       to the greedy at once. The greedy scores a size by how well it packs the current
+       part only, so offering more sizes can make the result worse - measured at -1.1
+       points on Sample_data_03. Searching subsets makes that impossible, because the
+       smaller set is always still a candidate. Worth about +2.5 points there.
+    2. Repacks the winning subset with exhaustive scrap decomposition (all 48 merge
+       orders rather than 8 sampled). Worth about +0.15 points for ~3x the time, which is
+       why it runs once at the end rather than on every candidate.
+
+    Deliberately structured as search-then-delegate: once the subset is chosen, the real
+    run goes through upload_and_optimize unchanged, so history, visualisations, scrap
+    inventory and the response shape cannot drift between the two endpoints.
+
+    Runtime is minutes, not seconds. Callers should expect to wait or run it in the
+    background.
+    """
+    import time
+    import traceback
+    from django.conf import settings
+    from .deep_search import (DEFAULT_ORDER_ATTEMPTS, search_parent_subsets,
+                              search_prism_order)
+
+    started = time.time()
+    print(f"\n{'='*80}\n=== DEEP OPTIMIZATION REQUEST ===\n{'='*80}")
+
+    try:
+        excel_file = request.FILES.get('file')
+        if not excel_file:
+            return Response({'success': False, 'error': 'No file uploaded'}, status=400)
+
+        try:
+            parent_blocks_data = json.loads(request.POST.get('parent_blocks', '[]'))
+            selected_blocks = json.loads(request.POST.get('selected_blocks', '[]'))
+        except json.JSONDecodeError as e:
+            return Response({'success': False,
+                             'error': f'Invalid JSON in parameters: {str(e)}'}, status=400)
+
+        if not parent_blocks_data:
+            return Response({'success': False, 'error': 'No parent blocks provided'}, status=400)
+
+        buffer_spacing = float(request.POST.get('buffer_spacing', '2.0'))
+        strategy = str(request.POST.get('search_strategy', 'auto')).strip().lower()
+        try:
+            time_budget = float(request.POST.get('search_time_budget', '') or 0) or None
+        except ValueError:
+            time_budget = None
+        try:
+            order_attempts = int(request.POST.get('order_attempts', '')
+                                 or DEFAULT_ORDER_ATTEMPTS)
+        except ValueError:
+            order_attempts = DEFAULT_ORDER_ATTEMPTS
+        order_attempts = max(0, order_attempts)
+
+        # ---- parse the offered sizes exactly as the quick endpoint does ----
+        sizes, labels, quantities = [], [], []
+        for i, block in enumerate(parent_blocks_data):
+            try:
+                if isinstance(block, dict):
+                    if 'dimensions' in block:
+                        d = block['dimensions']
+                        length, width, height = (float(d.get('length', 0)),
+                                                 float(d.get('width', 0)),
+                                                 float(d.get('height', 0)))
+                    elif all(k in block for k in ('length', 'width', 'height')):
+                        length, width, height = (float(block['length']), float(block['width']),
+                                                 float(block['height']))
+                    else:
+                        print(f"Warning: Parent block {i} has invalid format: {block}")
+                        continue
+                elif isinstance(block, list) and len(block) == 3:
+                    length, width, height = float(block[0]), float(block[1]), float(block[2])
+                else:
+                    print(f"Warning: Parent block {i} has invalid format: {block}")
+                    continue
+
+                if length <= 0 or width <= 0 or height <= 0:
+                    continue
+
+                quantity = None
+                if isinstance(block, dict) and block.get('quantity') is not None:
+                    try:
+                        quantity = int(block['quantity'])
+                        if quantity <= 0:
+                            continue
+                    except (TypeError, ValueError):
+                        quantity = None
+
+                sizes.append([length, width, height])
+                labels.append(block.get('label', f'{length}×{width}×{height}')
+                              if isinstance(block, dict) else f'{length}×{width}×{height}')
+                quantities.append(quantity)
+            except Exception as e:
+                print(f"Error processing parent block {i}: {e}")
+                continue
+
+        if not sizes:
+            return Response({'success': False,
+                             'error': 'No valid parent blocks provided'}, status=400)
+
+        # ---- recovered scrap, same rules as the quick endpoint ----
+        use_scrap_inventory = str(
+            request.POST.get('use_scrap_inventory', 'false')
+        ).strip().lower() in ('true', '1', 'yes')
+        recovered_stock = []
+        if use_scrap_inventory:
+            try:
+                from .models import ScrapInventory
+                inv = ScrapInventory.objects.filter(
+                    is_in_inventory=True, usability__in=['usable', 'manual'])
+                ids_raw = request.POST.get('scrap_inventory_ids', '')
+                if ids_raw.strip():
+                    inv = inv.filter(id__in=[int(v) for v in json.loads(ids_raw)])
+                recovered_stock = [{'id': s.id, 'scrap_id': s.scrap_id,
+                                    'size': [float(s.length), float(s.width), float(s.height)]}
+                                   for s in inv]
+            except Exception as e:
+                print(f"Error loading scrap inventory for deep search (non-critical): {e}")
+                recovered_stock = []
+
+        # ---- build the search's own copy of the parts ----
+        # Same filtering the quick endpoint applies, so the subset is chosen against the
+        # parts that will actually be packed.
+        search_path, demand = _write_search_workbook(excel_file, selected_blocks)
+        if search_path is None:
+            return Response({'success': False,
+                             'error': 'Could not read parts from the uploaded file'}, status=400)
+
+        print(f"[DEEP] {len(sizes)} sizes offered, {demand} parts, "
+              f"{len(recovered_stock)} scrap pieces, strategy={strategy}")
+
+        try:
+            search = search_parent_subsets(
+                excel_path=search_path,
+                parent_block_sizes=sizes,
+                parent_labels=labels,
+                parent_quantities=quantities,
+                demand=demand,
+                buffer=buffer_spacing,
+                recovered_stock=recovered_stock,
+                strategy=strategy,
+                time_budget=time_budget,
+            )
+
+            print(f"[DEEP] chose {search['chosen_labels']} "
+                  f"({search['chosen_efficiency']}%, {search['chosen_blocks']} blocks) "
+                  f"from {search['candidates_evaluated']} candidates "
+                  f"in {search['search_seconds']}s")
+
+            # ---- second stage: processing order, on the winning subset only ----
+            # The order part types are packed in moves efficiency far more than anything
+            # else here, and volume-descending - the hardcoded default - is good but not
+            # best. Searched after the subset rather than jointly, so it costs
+            # order_attempts packings rather than multiplying the subset scan.
+            chosen = set(search['chosen_indices'])
+            order = None
+            if order_attempts > 1:
+                remaining = (time_budget - search['search_seconds']) if time_budget else None
+                if remaining is None or remaining > 0:
+                    order = search_prism_order(
+                        excel_path=search_path,
+                        parent_block_sizes=[sizes[i] for i in sorted(chosen)],
+                        parent_quantities=[quantities[i] for i in sorted(chosen)],
+                        demand=demand,
+                        buffer=buffer_spacing,
+                        recovered_stock=recovered_stock,
+                        attempts=order_attempts,
+                        time_budget=remaining,
+                    )
+                    print(f"[DEEP] order seed {order['seed']} "
+                          f"({order['improvement_points']:+} points over volume-descending) "
+                          f"from {order['attempts']} attempts in {order['search_seconds']}s")
+                else:
+                    print("[DEEP] skipping order search, time budget already spent")
+            search['prism_order'] = order
+        finally:
+            try:
+                os.remove(search_path)
+            except Exception:
+                pass
+
+        # ---- final run: winning subset only, through the untouched quick endpoint ----
+        winning_payload = [
+            {'label': labels[i], 'quantity': quantities[i],
+             'dimensions': {'length': sizes[i][0], 'width': sizes[i][1], 'height': sizes[i][2]}}
+            for i in range(len(sizes)) if i in chosen
+        ]
+
+        # The uploaded file was consumed building the search workbook; rewind so the
+        # delegate can read it again.
+        try:
+            excel_file.seek(0)
+        except Exception:
+            pass
+
+        # Swap in the winning subset before delegating. DRF's Request.POST is a read-only
+        # property over the parsed form data, so the parsed data itself is what has to be
+        # replaced - and _full_data, DRF's merged view of data + files, has to be rebuilt
+        # the same way _load_data_and_files does it or the delegate sees stale values.
+        post = request.POST.copy()
+        post['parent_blocks'] = json.dumps(winning_payload)
+        post._mutable = False
+        request._data = post
+        if request._files:
+            request._full_data = post.copy()
+            request._full_data.update(request._files)
+        else:
+            request._full_data = post
+        request._request._post = post
+
+        # Delegate to the underlying HttpRequest, not this DRF Request: upload_and_optimize
+        # is wrapped in @api_view, which builds its own Request and rejects one that is
+        # already wrapped. The multipart stream is spent by now, so DRF re-reads the parsed
+        # _post/_files set above - which is exactly the substitution we want it to see.
+        from .modules.fill import exhaustive_decomposition
+        from .modules.packing_orchestrator import prism_order as prism_order_ctx
+        order_seed = (search.get('prism_order') or {}).get('seed') or None
+        with exhaustive_decomposition(), prism_order_ctx(order_seed):
+            response = upload_and_optimize(request._request)
+
+        if response.status_code == 200 and isinstance(response.data, dict):
+            search['total_seconds'] = round(time.time() - started, 1)
+            response.data['optimization_mode'] = 'deep'
+            response.data['deep_search'] = search
+            response.data['message'] = (
+                f"{response.data.get('message', '')} Deep optimisation evaluated "
+                f"{search['candidates_evaluated']} combinations of your "
+                f"{len(sizes)} stock sizes and used {', '.join(search['chosen_labels'])}."
+            ).strip()
+
+            # Record the search on the history row too. upload_and_optimize only ever sees
+            # the winning subset, so without this the stored run says "3 sizes" when the
+            # user selected 5, with nothing to explain the difference - which reads as the
+            # backend quietly ignoring input. Keep the sizes as offered alongside the
+            # verdict so the record is self-contained.
+            _persist_deep_search(response.data.get('history_id'), search, sizes, labels,
+                                 quantities)
+
+        return response
+
+    except Exception as e:
+        print(f"=== DEEP OPTIMIZATION FAILED ===\n{e}")
+        traceback.print_exc()
+        return Response({
+            'success': False,
+            'error': f'Deep optimization failed: {str(e)}',
+            'traceback': traceback.format_exc() if settings.DEBUG else None
+        }, status=500)
+
+
+def _persist_deep_search(history_id, search, sizes, labels, quantities):
+    """
+    Attach the deep search to its OptimizationHistory row.
+
+    Non-fatal: the plan itself is already saved and correct without this. What is lost on
+    failure is only the explanation of why some offered sizes went unused.
+    """
+    if not history_id:
+        return
+
+    try:
+        from .models import OptimizationHistory
+
+        history = OptimizationHistory.objects.get(id=history_id)
+        params = history.parameters or {}
+        params['optimization_mode'] = 'deep'
+        params['deep_search'] = search
+        # What the caller actually offered, before the search narrowed it. parent_blocks_used
+        # holds the winning subset, so on its own it cannot show what was rejected.
+        params['parent_blocks_offered'] = [[float(d) for d in s] for s in sizes]
+        params['parent_labels_offered'] = list(labels)
+        params['parent_quantities_offered'] = list(quantities)
+        history.parameters = params
+        history.save(update_fields=['parameters'])
+
+        print(f"[DEEP] recorded search on optimization #{history_id}")
+
+    except Exception as e:
+        print(f"[DEEP] could not record search on history {history_id} (non-critical): {e}")
+
+
+def _write_search_workbook(excel_file, selected_blocks):
+    """
+    Standardise the uploaded BOM to a temp workbook the search can re-read cheaply.
+
+    Mirrors the column mapping and part filtering in upload_and_optimize. Duplicated
+    rather than extracted so the quick endpoint stays untouched; if that parser ever
+    changes, this has to change with it.
+
+    Returns (path, total_quantity) or (None, 0).
+    """
+    import uuid
+    from django.conf import settings
+
+    try:
+        if excel_file.name.lower().endswith('.csv'):
+            df = pd.read_csv(excel_file)
+        else:
+            df = pd.read_excel(excel_file, engine='openpyxl')
+    except Exception as e:
+        print(f"[DEEP] could not read uploaded file: {e}")
+        return None, 0
+
+    df.columns = [str(c).strip() for c in df.columns]
+    mapping = {}
+    for col in df.columns:
+        low = str(col).lower()
+        if 'mark' in low or 'code' in low:
+            mapping[col] = 'MARK'
+        elif 'bottom' in low and 'length' in low:
+            mapping[col] = 'Bottom Length'
+        elif 'top' in low and 'length' in low:
+            mapping[col] = 'Top Length'
+        elif 'width' in low or 'breadth' in low or low == 'w':
+            mapping[col] = 'Width'
+        elif 'height' in low or 'thickness' in low or 'depth' in low or low == 'h':
+            mapping[col] = 'Height'
+        elif 'nos' in low or 'quantity' in low or 'qty' in low or 'count' in low:
+            mapping[col] = 'Nos'
+    df.rename(columns=mapping, inplace=True)
+
+    required = ['MARK', 'Bottom Length', 'Top Length', 'Width', 'Height', 'Nos']
+    if any(c not in df.columns for c in required):
+        print(f"[DEEP] missing columns: {[c for c in required if c not in df.columns]}")
+        return None, 0
+
+    rows = []
+    for _, row in df.iterrows():
+        mark = row.get('MARK')
+        if pd.isna(mark) or str(mark).strip() == '':
+            continue
+        try:
+            part = {
+                'MARK': str(mark).strip(),
+                'Bottom Length': float(row.get('Bottom Length', 0)),
+                'Top Length': float(row.get('Top Length', 0)),
+                'Width': float(row.get('Width', 0)),
+                'Height': float(row.get('Height', 0)),
+                'Nos': int(float(row.get('Nos', 0))),
+            }
+        except (TypeError, ValueError):
+            continue
+        if part['Nos'] <= 0 or min(part['Bottom Length'], part['Width'], part['Height']) <= 0:
+            continue
+        if selected_blocks and part['MARK'] not in selected_blocks:
+            continue
+        rows.append(part)
+
+    if not rows:
+        return None, 0
+
+    temp_dir = os.path.join(settings.MEDIA_ROOT, 'temp_uploads')
+    os.makedirs(temp_dir, exist_ok=True)
+    path = os.path.join(temp_dir, f"deep_search_{uuid.uuid4().hex[:8]}.xlsx")
+    pd.DataFrame(rows).to_excel(path, index=False, engine='openpyxl')
+
+    return path, sum(r['Nos'] for r in rows)
 
 
 # ================================
@@ -2009,6 +2779,7 @@ def get_optimization_history(request):
     - Normal users: see only their own history
     - Superadmin/staff: see all users' history (pass all_users=true)
     - Search: ?search=<id or job name>
+    - Executed only: ?executed_only=true (filters the whole history, not just this page)
     """
     try:
         from .models import OptimizationHistory
@@ -2018,6 +2789,7 @@ def get_optimization_history(request):
         page_size = min(100, max(1, int(request.GET.get('page_size', 50))))
         search = request.GET.get('search', '').strip()
         show_all = request.GET.get('all_users', 'false').lower() == 'true'
+        executed_only = request.GET.get('executed_only', 'false').lower() == 'true'
 
         # Superadmin/staff can see everyone's history
         if show_all and (request.user.is_superuser or request.user.is_staff):
@@ -2034,6 +2806,12 @@ def get_optimization_history(request):
                 )
             else:
                 history = history.filter(job_name__icontains=search)
+
+        # "Show Executed Only" toggle. Applied before the count and the slice so the
+        # frontend pages over executed runs across the whole history, not over whichever
+        # of them happen to land on the page it already downloaded.
+        if executed_only:
+            history = history.filter(is_executed=True)
 
         total_count = history.count()
         start = (page - 1) * page_size
@@ -2082,7 +2860,19 @@ def get_optimization_details(request, history_id):
             history = OptimizationHistory.objects.get(id=history_id)
         else:
             history = OptimizationHistory.objects.get(id=history_id, user=request.user)
-        
+
+        # Runs saved before the summary existed still hold their full blocks/scraps lists,
+        # so the summary is rebuilt on read rather than leaving those pages blank until
+        # someone re-runs the job. Computed only, never written back.
+        optimization_results = history.optimization_results or {}
+        if 'settings' not in (optimization_results.get('summary') or {}):
+            try:
+                optimization_results = dict(optimization_results)
+                optimization_results['summary'] = dict(optimization_results.get('summary') or {})
+                optimization_results['summary'].update(summary_for_history(history))
+            except Exception as e:
+                print(f"[HISTORY] Could not rebuild summary for #{history.id} (non-critical): {e}")
+
         return Response({
             'success': True,
             'data': {
@@ -2095,18 +2885,20 @@ def get_optimization_details(request, history_id):
                 'selected_blocks': history.selected_blocks,
                 'selected_parents': history.selected_parents,
                 'parameters': history.parameters,
-                'optimization_results': history.optimization_results,
+                'optimization_results': optimization_results,
                 'is_executed': history.is_executed,
                 'label': history.label,
                 'label_color': history.label_color,
                 'username': history.user.username,
                 'prism_summary': history.prism_summary,
-                'summary': {
+                # Carries the same sections as optimization_results['summary'], so the page
+                # does not have to know which of the two to read.
+                'summary': dict({
                     'total_blocks_created': history.total_blocks_created,
                     'total_parts_packed': history.total_parts_packed,
                     'total_parts_requested': history.total_parts_requested,
                     'is_successful': history.is_successful
-                }
+                }, **(optimization_results.get('summary') or {}))
             }
         })
         
@@ -2336,7 +3128,8 @@ def rerun_history_optimization(request, history_id):
         # 4. PROCESS PARENT BLOCKS
         parent_block_sizes = []
         parent_labels = []
-        
+        parent_quantities = []
+
         for i, block in enumerate(parent_blocks_data):
             try:
                 if isinstance(block, dict):
@@ -2357,22 +3150,55 @@ def rerun_history_optimization(request, history_id):
                     height = float(block[2])
                 else:
                     continue
-                
+
                 if length <= 0 or width <= 0 or height <= 0:
                     continue
-                    
+
+                # Same optional stock limit the initial run accepts; absent = unlimited.
+                quantity = None
+                if isinstance(block, dict) and block.get('quantity') is not None:
+                    try:
+                        quantity = int(block['quantity'])
+                        if quantity <= 0:
+                            continue
+                    except (TypeError, ValueError):
+                        quantity = None
+
                 parent_block_sizes.append([length, width, height])
                 label = block.get('label', f'{length}×{width}×{height}') if isinstance(block, dict) else f'{length}×{width}×{height}'
                 parent_labels.append(label)
+                parent_quantities.append(quantity)
             except Exception as e:
                 continue
-                
+
         if not parent_block_sizes:
             return Response({
                 'success': False,
                 'error': 'No valid parent blocks provided'
             }, status=400)
-            
+
+        # Supply stage 1 on a rerun. Without this the endpoint would accept
+        # use_scrap_inventory, report it as enabled in the summary, and pack against no
+        # scrap at all.
+        recovered_stock = []
+        if bool(data.get('use_scrap_inventory', False)):
+            try:
+                from .models import ScrapInventory
+                inv_qs = ScrapInventory.objects.filter(
+                    is_in_inventory=True, usability__in=['usable', 'manual'])
+                ids = data.get('scrap_inventory_ids')
+                if ids:
+                    inv_qs = inv_qs.filter(id__in=[int(v) for v in ids])
+                recovered_stock = [
+                    {'id': s.id, 'scrap_id': s.scrap_id,
+                     'size': [float(s.length), float(s.width), float(s.height)]}
+                    for s in inv_qs
+                ]
+                print(f"Rerun: offering {len(recovered_stock)} racked pieces")
+            except Exception as e:
+                print(f"Error loading scrap inventory on rerun (non-critical): {e}")
+                recovered_stock = []
+
         # 5. FILTER SELECTED PARTS IF SPECIFIED
         original_part_count = len(parts_data)
         if selected_blocks:
@@ -2434,7 +3260,9 @@ def rerun_history_optimization(request, history_id):
                     excel_path=temp_file_path,
                     parent_block_sizes=parent_block_sizes,
                     buffer=buffer_spacing,
-                    max_tries=max_retries
+                    max_tries=max_retries,
+                    parent_block_quantities=parent_quantities,
+                    recovered_stock=recovered_stock
                 )
             else:
                 from .modules.packing_orchestrator import Prisms, run_final_code, get_block_details
@@ -2443,7 +3271,10 @@ def rerun_history_optimization(request, history_id):
                     size = [part['Bottom Length'], part['Top Length'], part['Width'], part['Height']]
                     all_prisms.append(Prisms(code=part['MARK'], size=size, quantity=part['Nos']))
                 prism_list_sorted = sorted(all_prisms, key=lambda p: p.get_volume(), reverse=True)
-                helper = run_final_code(all_prisms=prism_list_sorted, buffer=buffer_spacing, parent_block_sizes=parent_block_sizes)
+                helper = run_final_code(all_prisms=prism_list_sorted, buffer=buffer_spacing,
+                                        parent_block_sizes=parent_block_sizes,
+                                        parent_block_quantities=parent_quantities,
+                                        recovered_stock=recovered_stock)
                 block_details = get_block_details(helper)
                 
             if helper is None:
@@ -2472,10 +3303,18 @@ def rerun_history_optimization(request, history_id):
             if block_details is None:
                 block_details = get_block_details(helper)
                 
+            # Same split as the initial run: a recovered block is material already on the
+            # rack, so it is excluded from bought-stock volume and from efficiency, and the
+            # prism term is restricted with it to keep the ratio below 100%.
+            new_blocks = [b for b in helper.all_big_blocks if not getattr(b, 'is_recovered', False)]
+            recovered_blocks = [b for b in helper.all_big_blocks if getattr(b, 'is_recovered', False)]
+            recovered_codes = {b.unique_code for b in recovered_blocks}
+
             total_parts_packed = 0
             total_prism_volume = 0
+            recovered_prism_volume = 0
             total_requested = sum(part['Nos'] for part in standardized_parts)
-            
+
             if block_details and 'blocks' in block_details:
                 for block in block_details['blocks']:
                     if 'prisms' in block:
@@ -2483,13 +3322,17 @@ def rerun_history_optimization(request, history_id):
                             for part in standardized_parts:
                                 if part['MARK'] == prism_info['code']:
                                     prism_volume = 0.5 * (part['Bottom Length'] + part['Top Length']) * part['Width'] * part['Height']
-                                    total_parts_packed += prism_info.get('number', 0)
-                                    total_prism_volume += prism_volume * prism_info.get('number', 0)
+                                    count = prism_info.get('number', 0)
+                                    total_parts_packed += count
+                                    if block.get('code') in recovered_codes:
+                                        recovered_prism_volume += prism_volume * count
+                                    else:
+                                        total_prism_volume += prism_volume * count
                                     break
-                                    
-            total_stock_volume = sum(block.volume for block in helper.all_big_blocks)
+
+            total_stock_volume = sum(block.volume for block in new_blocks)
             efficiency = (total_prism_volume / total_stock_volume * 100) if total_stock_volume > 0 else 0
-            
+
             blocks_info = []
             for block in helper.all_big_blocks:
                 prism_counts = {}
@@ -2498,16 +3341,19 @@ def rerun_history_optimization(request, history_id):
                     count = len(entry['coordinates'])
                     prism_counts[prism.code] = prism_counts.get(prism.code, 0) + count
                 prism_list = [{"code": code, "count": count} for code, count in prism_counts.items()]
-                
+
                 blocks_info.append({
                     'code': block.unique_code,
                     'size': [float(dim) for dim in block.size],
                     'efficiency': float(block.get_efficiency()),
                     'prisms': prism_list,
                     'volume': float(block.volume),
-                    'start_coord': [float(coord) for coord in block.start_coord]
+                    'start_coord': [float(coord) for coord in block.start_coord],
+                    'pattern_key': layout_signature(block),
+                    'is_recovered': bool(getattr(block, 'is_recovered', False)),
+                    'source_scrap_id': getattr(block, 'source_scrap_id', None)
                 })
-                
+
             scraps_info = []
             for scrap in helper.all_scrap:
                 scraps_info.append({
@@ -2549,8 +3395,8 @@ def rerun_history_optimization(request, history_id):
         # Delete old scraps associated with this history item first
         ScrapInventory.objects.filter(optimization_history=history).delete()
         
-        # Clear helper cache
-        django_cache.delete(f"helper_objs_{history.id}")
+        # Clear helper cache - best effort; a stale entry is superseded by the write below
+        cache_delete_safe(f"helper_objs_{history.id}", label=f"helper_objs_{history.id}")
         
         # Update fields
         optimization_results = {
@@ -2561,14 +3407,41 @@ def rerun_history_optimization(request, history_id):
                 'total_parts_packed': total_parts_packed,
                 'total_parts_requested': total_requested,
                 'packing_percentage': round(total_parts_packed / total_requested * 100, 2) if total_requested > 0 else 0,
-                'total_blocks_created': len(helper.all_big_blocks),
+                'total_blocks_created': len(new_blocks),
                 'total_stock_volume': round(total_stock_volume, 2),
                 'total_prism_volume': round(total_prism_volume, 2),
                 'waste_percentage': round(100 - efficiency, 2),
+                'total_recovered_blocks': len(recovered_blocks),
+                'material_saved_volume': round(recovered_prism_volume, 2),
                 'optimization_duration_seconds': round(optimization_duration, 2)
             }
         }
-        
+
+        # Same shop-floor summary the initial run produces, so a reran job does not lose it.
+        scrap_inventory_enabled = bool(data.get('use_scrap_inventory', False))
+        consumed_from_inventory = [
+            c for c in getattr(helper, 'consumed_scraps', [])
+            if c.get('origin') == 'inventory'
+        ]
+        try:
+            # Recovered blocks are excluded from the pull list; see the same split in
+            # upload_and_optimize.
+            optimization_results['summary'].update(build_summary(
+                blocks=[b for b in blocks_info if not b.get('is_recovered')],
+                scraps=scraps_info,
+                prism_summary=prism_summary,
+                stock_sizes=stock_sizes_from(parent_block_sizes, parent_labels),
+                blade_thickness=buffer_spacing,
+                source_file=data.get('uploaded_file_name') or history.uploaded_file_name,
+                run_by=request.user.username,
+                run_at=timezone.now().isoformat(),
+                scrap_inventory_enabled=scrap_inventory_enabled,
+                consumed_scraps=consumed_from_inventory,
+            ))
+        except Exception as e:
+            print(f"Error building run summary on rerun (non-critical): {e}")
+            traceback.print_exc()
+
         history.uploaded_file_data = standardized_parts
         if data.get('uploaded_file_name'):
             history.uploaded_file_name = data.get('uploaded_file_name')
@@ -2582,11 +3455,21 @@ def rerun_history_optimization(request, history_id):
             'retry_enabled': retry_enabled,
             'original_part_count': original_part_count,
             'filtered_part_count': len(standardized_parts),
-            'optimization_duration_seconds': optimization_duration
+            'optimization_duration_seconds': optimization_duration,
+            'scrap_inventory_enabled': scrap_inventory_enabled,
+            'consumed_scraps': consumed_from_inventory,
+            'parent_block_quantities': parent_quantities,
+            'recovered_stock': recovered_stock,
+            # Rewritten, not merged: a rerun replaces the plan, so the pieces the previous
+            # plan would have consumed must not stay on the execute list.
+            'consumed_scrap_inventory_ids': [
+                b.source_inventory_id for b in recovered_blocks
+                if getattr(b, 'source_inventory_id', None) is not None
+            ]
         }
         history.optimization_results = optimization_results
         history.efficiency = round(efficiency, 2)
-        history.total_blocks_created = len(helper.all_big_blocks)
+        history.total_blocks_created = len(new_blocks)
         history.total_parts_packed = total_parts_packed
         history.total_parts_requested = total_requested
         history.prism_summary = prism_summary
@@ -2601,9 +3484,12 @@ def rerun_history_optimization(request, history_id):
         except Exception as pkl_err:
             print(f"Failed to save pickled helper: {pkl_err}")
             
-        # Recache helper
-        django_cache.set(f"helper_objs_{history.id}", helper, timeout=1800)
-        django_cache.set("latest_helper", helper, timeout=60 * 60 * 24 * 7)
+        # Recache helper. Non-fatal for the same reason as the initial run: the rerun has
+        # already been written to the history row above.
+        cache_set_safe(f"helper_objs_{history.id}", helper, timeout=1800,
+                       label=f"helper_objs_{history.id}")
+        cache_set_safe("latest_helper", helper, timeout=60 * 60 * 24 * 7,
+                       label="latest_helper")
         
         # 10. REGENERATE BLOCK 6-SIDE VISUALIZATIONS
         html_base_dir = os.path.join(settings.MEDIA_ROOT, "block_html", str(history.id))
@@ -2653,15 +3539,15 @@ def rerun_history_optimization(request, history_id):
                 'label_color': history.label_color,
                 'username': history.user.username,
                 'prism_summary': history.prism_summary,
-                'summary': {
+                'summary': dict({
                     'total_blocks_created': history.total_blocks_created,
                     'total_parts_packed': history.total_parts_packed,
                     'total_parts_requested': history.total_parts_requested,
                     'is_successful': history.is_successful
-                }
+                }, **((history.optimization_results or {}).get('summary') or {}))
             }
         })
-        
+
     except Exception as e:
         traceback.print_exc()
         return Response({

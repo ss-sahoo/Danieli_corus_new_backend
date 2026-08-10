@@ -261,10 +261,13 @@ def toggle_executed(request, history_id):
         history.is_executed = True
         history.save(update_fields=['is_executed'])
 
-        # Mark existing scraps of this optimization as in-inventory on execution
+        # Mark existing scraps of this optimization as in-inventory on execution, and
+        # retire the racked pieces this job cut into. Execution is one-way here, so no
+        # un-consume path is needed.
         try:
-            from .inventory_views import mark_scraps_as_executed
+            from .inventory_views import mark_scraps_as_executed, mark_consumed_inventory_scraps
             mark_scraps_as_executed(history)
+            mark_consumed_inventory_scraps(history)
         except Exception as inv_err:
             print(f"[INVENTORY] Error marking scraps as executed (non-critical): {inv_err}")
 
