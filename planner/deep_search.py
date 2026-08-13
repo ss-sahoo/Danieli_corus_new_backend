@@ -39,7 +39,8 @@ import itertools
 import time
 from typing import Any, Dict, List, Optional
 
-from .modules.packing_orchestrator import prism_order, run_optimization_with_retries
+from .modules.packing_orchestrator import (lookahead_selection, prism_order,
+                                           run_optimization_with_retries)
 
 # Above this many free sizes, 'auto' falls back to hill climbing. Exhaustive is 2^n - 1
 # packings, so the wall clock roughly doubles per size added. At ~8.5 s per packing:
@@ -74,18 +75,23 @@ def _evaluate(excel_path, sizes, quantities, buffer, max_tries, recovered_stock,
     that can, however good its efficiency looks - efficiency over a partial packing is
     measuring the wrong thing.
     """
-    helper, details = run_optimization_with_retries(
-        excel_path=excel_path,
-        parent_block_sizes=sizes,
-        buffer=buffer,
-        max_tries=max_tries,
-        parent_block_quantities=quantities,
-        recovered_stock=recovered_stock,
-        # Force first-legal during the scan. search_attempts defaults to 5 whenever quotas
-        # or scrap are present, which is a measured ~4.8x on every candidate - unaffordable
-        # when the point is to run many of them. The winner is repacked properly later.
-        search_attempts=1,
-    )
+    # Lookahead is on for every candidate, not just the winner: it changes which sizes are
+    # worth having, so a subset ranked without it would be the best subset for a packer we
+    # are not going to use.
+    with lookahead_selection():
+        helper, details = run_optimization_with_retries(
+            excel_path=excel_path,
+            parent_block_sizes=sizes,
+            buffer=buffer,
+            max_tries=max_tries,
+            parent_block_quantities=quantities,
+            recovered_stock=recovered_stock,
+            # Force first-legal during the scan. search_attempts defaults to 5 whenever
+            # quotas or scrap are present, which is a measured ~4.8x on every candidate -
+            # unaffordable when the point is to run many of them. The winner is repacked
+            # properly later.
+            search_attempts=1,
+        )
 
     new_blocks = [b for b in helper.all_big_blocks if not getattr(b, 'is_recovered', False)]
     stock_volume = sum(b.volume for b in new_blocks)

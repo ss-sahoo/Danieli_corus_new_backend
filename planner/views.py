@@ -2553,9 +2553,12 @@ def upload_and_optimize_deep(request):
         # already wrapped. The multipart stream is spent by now, so DRF re-reads the parsed
         # _post/_files set above - which is exactly the substitution we want it to see.
         from .modules.fill import exhaustive_decomposition
-        from .modules.packing_orchestrator import prism_order as prism_order_ctx
+        from .modules.packing_orchestrator import (lookahead_selection,
+                                                   prism_order as prism_order_ctx)
         order_seed = (search.get('prism_order') or {}).get('seed') or None
-        with exhaustive_decomposition(), prism_order_ctx(order_seed):
+        # Same three settings the search ran under, so the final plan is the one that was
+        # actually measured rather than a different packer given the winning inputs.
+        with exhaustive_decomposition(), prism_order_ctx(order_seed), lookahead_selection():
             response = upload_and_optimize(request._request)
 
         if response.status_code == 200 and isinstance(response.data, dict):

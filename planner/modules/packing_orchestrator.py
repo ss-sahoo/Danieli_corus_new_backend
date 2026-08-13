@@ -32,10 +32,109 @@ OVERLAP_TOL = 1e-4
 
 PRISM_ORDER_SEED = None
 
+
+# ---------------------------------------------------------------------------
+# Lookahead block selection
+# ---------------------------------------------------------------------------
+# check_which_block_to_add scores a candidate stock size by how many of the ONE part
+# triggering the block fit in it. That is myopic: most of a block's value is in what its
+# leftover slab is worth to the part types packed after it, and the plain metric cannot
+# see that. It is the reason offering an extra size can make a result worse - a 12%
+# smaller block that packs the same count wins on paper while giving up the headroom a
+# later part needed.
+#
+# With lookahead on, a candidate is scored by the total part volume it is expected to
+# yield: the current part, plus what the other outstanding part types can take out of the
+# scrap this packing would leave. Measured on Sample_data_03 with all five sizes offered:
+# 78.67% -> 80.59%, 796 -> 706 blocks, for about 2.3x the packing time.
+#
+# Off by default. The deep optimisation turns it on; the quick endpoint is unchanged.
+
+LOOKAHEAD_SELECTION = False
+LOOKAHEAD_TOP_K = 6        # how many other pending part types to try in the leftovers
+LOOKAHEAD_MAX_SCRAPS = 6   # how many of the largest leftover boxes to try them in
+
+
+@contextmanager
+def lookahead_selection(enabled: bool = True, top_k: int = None, max_scraps: int = None):
+    """
+    Score candidate blocks by total yield rather than by the current part alone.
+
+    Module state for the same reason as prism_order and fill.exhaustive_decomposition:
+    the decision happens deep inside the packing loop. Not thread-safe.
+    """
+    global LOOKAHEAD_SELECTION, LOOKAHEAD_TOP_K, LOOKAHEAD_MAX_SCRAPS
+    previous = (LOOKAHEAD_SELECTION, LOOKAHEAD_TOP_K, LOOKAHEAD_MAX_SCRAPS)
+    LOOKAHEAD_SELECTION = enabled
+    if top_k is not None:
+        LOOKAHEAD_TOP_K = top_k
+    if max_scraps is not None:
+        LOOKAHEAD_MAX_SCRAPS = max_scraps
+    try:
+        yield
+    finally:
+        LOOKAHEAD_SELECTION, LOOKAHEAD_TOP_K, LOOKAHEAD_MAX_SCRAPS = previous
+
 # Largest number of adjacent transpositions a perturbation may apply. Past roughly this
 # many the order stops resembling volume-descending and the result degrades toward the
 # random-shuffle score (77%).
 MAX_ORDER_SWAPS = 8
+
+
+def prioritise_constrained_parts(prisms: List['Prisms'],
+                                 parent_block_sizes: List[List[float]],
+                                 parent_block_quantities: List[Optional[int]],
+                                 rotation_axis: List[List[str]] = None) -> List['Prisms']:
+    """
+    Move parts that depend entirely on quota-limited stock to the front of the queue.
+
+    Without this, a part with no alternative can be starved by a part that had one.
+    `check_which_block_to_add` prefers limited sizes (tier 0) so that owned stock is used
+    before more is bought, and parts are processed largest-volume-first. Together those two
+    rules let a big, flexible part spend a scarce size it merely *likes* before a smaller
+    part that can use nothing else ever gets a turn:
+
+        A, B unlimited; C limited to 2. BIG fits A, B and C. G2 fits only C.
+        BIG is larger, so it goes first, takes both C blocks, and G2 packs 2 of 40.
+
+    The test is "has no unlimited fitting size", not "fits exactly one size": a part that
+    fits two limited sizes is equally exposed, while a part that fits a limited size and an
+    unlimited one is not exposed at all.
+
+    The sort is stable and only lifts the exposed parts, so volume-descending order is
+    preserved within both groups. When no size carries a quantity, nothing is exposed and
+    the order is returned untouched - which is why this cannot affect an ordinary run.
+    """
+    if not parent_block_quantities or all(q is None for q in parent_block_quantities):
+        return prisms
+
+    unlimited = [i for i, q in enumerate(parent_block_quantities) if q is None]
+
+    def depends_on_scarce_stock(prism):
+        fits_unlimited = False
+        fits_anything = False
+        for i, size in enumerate(parent_block_sizes):
+            block = Block('probe', list(size), start_coord=[0, 0, 0])
+            if not block.can_fit_with_rotation(prism, rotation_axis)[0]:
+                continue
+            fits_anything = True
+            if i in unlimited:
+                fits_unlimited = True
+                break
+        # A part that fits nothing is not competing for stock; it is reported as a
+        # shortfall either way, and promoting it would only reorder the queue for nothing.
+        return fits_anything and not fits_unlimited
+
+    exposed = [p for p in prisms if depends_on_scarce_stock(p)]
+    if not exposed:
+        return prisms
+
+    exposed_ids = {id(p) for p in exposed}
+    rest = [p for p in prisms if id(p) not in exposed_ids]
+    print(f"[ORDER] {len(exposed)} part type(s) depend only on limited stock, "
+          f"packing first: {[p.code for p in exposed]}")
+
+    return exposed + rest
 
 
 def perturb_prism_order(prisms: List['Prisms'], seed: Optional[int]) -> List['Prisms']:
@@ -733,6 +832,9 @@ class People_helper:
         self.all_scrap_temp = []
         self.rejected_scrap_count = 0  # scrap boxes discarded as unsound, see add_update_scrap_list
         self.consumed_scraps = []  # scraps that had prisms packed into them, see delete_scrap
+        # Every part type in the job, set by run_final_code. Read only by lookahead block
+        # selection, which needs to know what the leftovers will have to serve.
+        self.pending_prisms = []
 
         # Mutable per-run stock ledger, parallel to parent_block_sizes. None = unlimited,
         # an int counts down as blocks are opened and is refunded when a fill fails.
@@ -904,6 +1006,8 @@ class People_helper:
                 continue
 
             best_count = 0
+            best_size = None
+            best_end = None
             for axis_order in rotation_axis_new:
                 if len(axis_order) != 0:
                     rot = Rotation(axis_order=axis_order, pivot=block.start_coord)
@@ -920,20 +1024,85 @@ class People_helper:
                 )
                 if prism_count > best_count:
                     best_count = prism_count
+                    best_size = size
+                    best_end = end_coordinates
 
             # can_fit_with_rotation ignores the buffer, so a size can pass it and still pack
             # nothing. Such a size is not a candidate.
             if best_count == 0:
                 continue
 
+            # Part volume this block is expected to produce. Without lookahead that is just
+            # the current part type, and dividing by it ranks candidates identically to the
+            # old volume/count rule - prism.volume is the same constant for every candidate
+            # here, so the default path is unchanged.
+            yielded = best_count * prism.volume
+            if LOOKAHEAD_SELECTION:
+                yielded = self._lookahead_yield(prism, yielded, best_size, best_end)
+
             tier = 0 if self.remaining_quantity[idx] is not None else 1
-            waste_per_part = (parent_size[0] * parent_size[1] * parent_size[2]) / best_count
+            waste_per_part = (parent_size[0] * parent_size[1] * parent_size[2]) / yielded
             candidates.append((tier, waste_per_part, idx, parent_size))
 
         if not candidates:
             return None
 
         return min(candidates, key=lambda c: (c[0], c[1]))[2]
+
+    def _lookahead_yield(self, prism, base_yield, size, end_coordinates):
+        """
+        Add to `base_yield` the part volume the OTHER outstanding part types could take out
+        of the scrap this packing would leave.
+
+        Approximate on purpose - it decides which block to open, it does not place anything.
+        Only the largest few leftover boxes and the largest few pending part types are
+        tried, and each box is credited to the first type that fits it, since a box cannot
+        serve two types at once.
+
+        The scrap derivation is forced back to sampled mode: this runs once per candidate
+        size per block opened, and the exhaustive decomposition the deep run uses for real
+        packing would multiply that by 48 for an estimate that does not need the precision.
+        """
+        if not end_coordinates:
+            return base_yield
+
+        pending = getattr(self, 'pending_prisms', None)
+        if not pending:
+            return base_yield
+
+        others = [p for p in pending
+                  if p is not prism and getattr(p, 'prism_left', 0) > 0][:LOOKAHEAD_TOP_K]
+        if not others:
+            return base_yield
+
+        from .fill import exhaustive_decomposition
+
+        try:
+            with exhaustive_decomposition(False):
+                _, boxes = get_scrap_vol(end_coordinates, size, [0, 0, 0], [],
+                                         buffer=self.buffer)
+        except Exception:
+            return base_yield
+
+        boxes = sorted(
+            boxes,
+            key=lambda b: -(b['Box_size'][0] * b['Box_size'][1] * b['Box_size'][2])
+        )[:LOOKAHEAD_MAX_SCRAPS]
+
+        for box in boxes:
+            for other in others:
+                try:
+                    _, _, _, count = fill_the_box(other,
+                                                  Block_size=box['Box_size'],
+                                                  starting_co=box['starting_co'],
+                                                  buffer=self.buffer)
+                except Exception:
+                    continue
+                if count > 0:
+                    base_yield += min(count, other.prism_left) * other.volume
+                    break  # this box is spoken for
+
+        return base_yield
 
     def fill_the_prism_optimally(self, prism, scrap) -> Tuple:
         """
@@ -1329,6 +1498,16 @@ def run_final_code(all_prisms: List[Prisms], buffer: float = 2,
         parent_block_sizes = [[2000, 800, 400], [2000, 500, 500]]
 
     helper = People_helper(buffer, parent_block_sizes, parent_block_quantities)
+
+    # Parts with no unlimited size to fall back on go first, or a flexible part can spend
+    # the scarce stock they depend on. No-op when no size carries a quantity.
+    all_prisms = prioritise_constrained_parts(
+        all_prisms, parent_block_sizes, helper.parent_block_quantities, helper.rotation_axis)
+
+    # Lookahead block selection needs to know what else is still outstanding; the packing
+    # loop otherwise only ever hands check_which_block_to_add a single prism. Unused when
+    # lookahead is off.
+    helper.pending_prisms = all_prisms
 
     # Stage 1: offer inventory offcuts as packable space before any stock is opened.
     for piece in (recovered_stock or []):
