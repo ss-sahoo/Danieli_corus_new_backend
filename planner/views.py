@@ -2114,6 +2114,19 @@ def upload_and_optimize(request):
                     prism_summary=prism_summary
                 )
                 
+                # Save the original uploaded file copy to media/uploaded_files
+                try:
+                    uploaded_files_dir = os.path.join(settings.MEDIA_ROOT, "uploaded_files")
+                    os.makedirs(uploaded_files_dir, exist_ok=True)
+                    excel_file.seek(0)
+                    dest_path = os.path.join(uploaded_files_dir, f"{history.id}_{excel_file.name}")
+                    with open(dest_path, 'wb+') as destination:
+                        for chunk in excel_file.chunks():
+                            destination.write(chunk)
+                    print(f"✓ Saved original upload copy to {dest_path}")
+                except Exception as f_err:
+                    print(f"⚠ Failed to save original upload copy: {f_err}")
+                
                 # Build a professional, industry-style job name:
                 # e.g. "OPT-0007 · SteelParts Jul11" instead of "Run #7 - sample_data"
                 raw_stem = os.path.splitext(excel_file.name)[0]          # e.g. "sample_data"
@@ -2915,6 +2928,90 @@ def get_optimization_details(request, history_id):
             'success': False,
             'error': str(e)
         }, status=500)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def download_uploaded_file(request, history_id):
+    """
+    Download the original uploaded file or dynamically regenerate it from uploaded_file_data if it is not saved on disk.
+    """
+    try:
+        from .models import OptimizationHistory
+        from django.http import HttpResponse
+        import os
+        import pandas as pd
+        import io
+        from django.conf import settings
+        import urllib.parse
+        
+        # Get the history item
+        if request.user.is_superuser or request.user.is_staff:
+            history = OptimizationHistory.objects.get(id=history_id)
+        else:
+            history = OptimizationHistory.objects.get(id=history_id, user=request.user)
+            
+        filename = history.uploaded_file_name or "uploaded_parts.xlsx"
+        
+        # First, check if the original file exists in media/uploaded_files
+        uploaded_file_path = os.path.join(settings.MEDIA_ROOT, "uploaded_files", f"{history.id}_{filename}")
+        
+        if os.path.exists(uploaded_file_path):
+            try:
+                with open(uploaded_file_path, 'rb') as f:
+                    file_content = f.read()
+                    
+                if filename.lower().endswith('.csv'):
+                    content_type = 'text/csv'
+                elif filename.lower().endswith('.xlsx'):
+                    content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                elif filename.lower().endswith('.xls'):
+                    content_type = 'application/vnd.ms-excel'
+                else:
+                    content_type = 'application/octet-stream'
+                    
+                response = HttpResponse(file_content, content_type=content_type)
+                quoted_filename = urllib.parse.quote(filename)
+                response['Content-Disposition'] = f"attachment; filename*=UTF-8''{quoted_filename}"
+                return response
+            except Exception as read_err:
+                print(f"Error reading saved file (generating fallback): {read_err}")
+        
+        # Dynamic generation fallback
+        data = history.uploaded_file_data
+        if not data:
+            return Response({'success': False, 'error': 'No file data stored for this run.'}, status=400)
+            
+        df = pd.DataFrame(data)
+        
+        # Format columns appropriately for the Excel columns expected
+        expected_cols = ['MARK', 'Bottom Length', 'Top Length', 'Width', 'Height', 'Nos']
+        existing_cols = [c for c in expected_cols if c in df.columns]
+        if existing_cols:
+            df = df[existing_cols]
+            
+        if filename.lower().endswith('.csv'):
+            csv_buffer = io.StringIO()
+            df.to_csv(csv_buffer, index=False)
+            response = HttpResponse(csv_buffer.getvalue(), content_type='text/csv')
+        else:
+            if not filename.lower().endswith('.xlsx') and not filename.lower().endswith('.xls'):
+                filename += '.xlsx'
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='Parts')
+            response = HttpResponse(excel_buffer.getvalue(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            
+        quoted_filename = urllib.parse.quote(filename)
+        response['Content-Disposition'] = f"attachment; filename*=UTF-8''{quoted_filename}"
+        return response
+        
+    except OptimizationHistory.DoesNotExist:
+        return Response({'success': False, 'error': 'Optimization history entry not found.'}, status=404)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return Response({'success': False, 'error': str(e)}, status=500)
 
 
 @api_view(['POST'])

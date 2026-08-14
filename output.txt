@@ -1,0 +1,11 @@
+Users:
+Username: admin, Staff: True, Superuser: True
+Username: admin06, Staff: True, Superuser: False
+Username: test_admin, Staff: False, Superuser: False
+Username: test_editor, Staff: False, Superuser: False
+
+Executed optimizations:
+ID: 40, Job: OPT-0040 · Sample Data 01 · 27 Jul 26, User: admin
+ID: 39, Job: OPT-0039 · Sample Data 01 · 27 Jul 26, User: admin
+ID: 5, Job: OPT-0005 · Sample Data · 11 Jul 26, User: admin
+ID: 2, Job: Sample_data - 2026-07-10 07:28:10, User: admin

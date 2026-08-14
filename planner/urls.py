@@ -19,6 +19,7 @@ from .views import (
     rerun_history_optimization,
     # rename_optimization,
     delete_optimization_history,
+    download_uploaded_file,
     
     # File upload and optimization
     upload_excel_file,
@@ -95,6 +96,7 @@ urlpatterns = [
     path('optimization-history/<int:history_id>/', get_optimization_details, name='optimization-details'),
     path('optimization-history/<int:history_id>/toggle-executed/', toggle_executed, name='toggle-executed'),
     path('optimization-history/<int:history_id>/rerun/', rerun_history_optimization, name='rerun-history-optimization'),
+    path('optimization-history/<int:history_id>/download-file/', download_uploaded_file, name='download-uploaded-file'),
     # path('optimization-history/<int:history_id>/rename/', rename_optimization, name='rename-optimization'),
     path('optimization-history/delete/', delete_optimization_history, name='delete-optimization-history'),
 ]
