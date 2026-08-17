@@ -1231,6 +1231,34 @@ def upload_and_optimize(request):
                 print(f"Warning: invalid scrap_inventory_ids, offering whole inventory: {e}")
                 scrap_inventory_ids = None
 
+        if use_scrap_inventory and scrap_inventory_ids:
+            # Validate that none of the selected scrap IDs are already consumed by an executed run
+            from .models import OptimizationHistory, ScrapInventory
+            from rest_framework.exceptions import ValidationError
+            
+            executed_runs = OptimizationHistory.objects.filter(is_executed=True)
+            consumed_ids = set()
+            for run in executed_runs:
+                c_ids = run.parameters.get('consumed_scrap_inventory_ids') or []
+                for cid in c_ids:
+                    consumed_ids.add(cid)
+            
+            conflict_ids = [cid for cid in scrap_inventory_ids if cid in consumed_ids]
+            if conflict_ids:
+                conflict_scraps = ScrapInventory.objects.filter(id__in=conflict_ids)
+                conflict_details = []
+                for s in conflict_scraps:
+                    c_run = None
+                    for run in executed_runs:
+                        if s.id in (run.parameters.get('consumed_scrap_inventory_ids') or []):
+                            c_run = run
+                            break
+                    c_run_str = f"'{c_run.job_name}'" if c_run else "an executed run"
+                    conflict_details.append(f"#{s.id} ('{s.scrap_id}') is already consumed by optimization {c_run_str}")
+                raise ValidationError(
+                    "One or more selected scrap pieces are already consumed: " + "; ".join(conflict_details)
+                )
+
         print(f"File: {excel_file.name} ({(excel_file.size/1024):.2f} KB)")
         print(f"Selected blocks: {len(selected_blocks)} items")
         print(f"Parent blocks data count: {len(parent_blocks_data)}")
@@ -2306,6 +2334,20 @@ def upload_and_optimize(request):
         return Response(results)
         
     except Exception as e:
+        from rest_framework.exceptions import ValidationError
+        if isinstance(e, ValidationError):
+            print(f"\n=== OPTIMIZATION VALIDATION FAILED ===")
+            print(f"Error: {str(e)}")
+            err_msg = e.detail if hasattr(e, 'detail') else str(e)
+            if isinstance(err_msg, dict) and 'detail' in err_msg:
+                err_msg = err_msg['detail']
+            if isinstance(err_msg, list):
+                err_msg = " ".join([str(x) for x in err_msg])
+            return Response({
+                'success': False,
+                'error': f"Validation error: {err_msg}"
+            }, status=400)
+
         print(f"\n=== OPTIMIZATION FAILED ===")
         print(f"Error: {str(e)}")
         traceback.print_exc()
@@ -3121,7 +3163,7 @@ def toggle_executed(request, history_id):
     Body: {"is_executed": true}
     """
     try:
-        from .models import OptimizationHistory
+        from .models import OptimizationHistory, ScrapInventory
         
         # Get the history item
         if request.user.is_superuser or request.user.is_staff:
@@ -3132,17 +3174,72 @@ def toggle_executed(request, history_id):
         # Get new status from request
         new_status = request.data.get('is_executed', False)
         
-        # Update status
-        history.is_executed = new_status
-        history.save()
-        
-        return Response({
-            'success': True,
-            'is_executed': history.is_executed,
-            'label': history.label,
-            'label_color': history.label_color,
-            'message': f'Optimization marked as {"executed" if new_status else "not executed"}'
-        })
+        if new_status:
+            if history.is_executed:
+                return Response({
+                    'success': False,
+                    'detail': 'This optimization has already been executed and cannot be reverted.'
+                }, status=400)
+
+            # Check if any consumed scrap is already consumed by another executed optimization
+            consumed_ids = history.parameters.get('consumed_scrap_inventory_ids') or []
+            if consumed_ids:
+                scraps = ScrapInventory.objects.filter(id__in=consumed_ids)
+                scraps_dict = {s.id: s.scrap_id for s in scraps}
+                
+                # Check overlap in executed optimizations
+                executed_runs = OptimizationHistory.objects.filter(is_executed=True).exclude(id=history.id)
+                for run in executed_runs:
+                    run_consumed_ids = run.parameters.get('consumed_scrap_inventory_ids') or []
+                    overlap_ids = set(consumed_ids).intersection(set(run_consumed_ids))
+                    if overlap_ids:
+                        conflict_scrap_ids = [scraps_dict.get(oid, f"ID {oid}") for oid in overlap_ids]
+                        conflict_scrap_str = ", ".join(conflict_scrap_ids)
+                        error_detail = (
+                            f'The scrap "{conflict_scrap_str}" is used in different optimization "{run.job_name}" '
+                            f'(ID: {run.id}) that is already executed. We cannot use this used scrap in any other optimization.'
+                        )
+                        return Response({
+                            'success': False,
+                            'error': error_detail,
+                            'detail': error_detail
+                        }, status=400)
+
+            history.is_executed = True
+            history.save(update_fields=['is_executed'])
+
+            # Mark existing scraps of this optimization as in-inventory on execution, and
+            # retire the racked pieces this job cut into. Execution is one-way here, so no
+            # un-consume path is needed.
+            try:
+                from .inventory_views import mark_scraps_as_executed, mark_consumed_inventory_scraps
+                mark_scraps_as_executed(history)
+                mark_consumed_inventory_scraps(history)
+            except Exception as inv_err:
+                print(f"[INVENTORY] Error marking scraps as executed (non-critical): {inv_err}")
+
+            return Response({
+                'success': True,
+                'is_executed': history.is_executed,
+                'label': history.label,
+                'label_color': history.label_color,
+                'message': 'Marked as executed and scraps added to inventory.'
+            })
+        else:
+            if history.is_executed:
+                return Response({
+                    'success': False,
+                    'detail': 'Cannot revert an executed optimization.'
+                }, status=400)
+            history.is_executed = False
+            history.save(update_fields=['is_executed'])
+            return Response({
+                'success': True,
+                'is_executed': history.is_executed,
+                'label': history.label,
+                'label_color': history.label_color,
+                'message': 'Optimization remains unexecuted.'
+            })
         
     except OptimizationHistory.DoesNotExist:
         return Response({

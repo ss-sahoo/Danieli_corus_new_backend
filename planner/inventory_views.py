@@ -11,7 +11,15 @@ from django.db import IntegrityError
 MIN_USABLE_MM = 15.0  # scraps with any dim <= this are "unusable"
 
 
-def _serialize_scrap(s):
+def _serialize_scrap(s, consumed_info=None, targeting_info=None):
+    consumed_by = None
+    if consumed_info and s.id in consumed_info:
+        consumed_by = consumed_info[s.id]
+    
+    targeted_by = []
+    if targeting_info and s.id in targeting_info:
+        targeted_by = targeting_info[s.id]
+        
     return {
         'id': s.id,
         'scrap_id': s.scrap_id,
@@ -27,6 +35,8 @@ def _serialize_scrap(s):
         'added_by': s.added_by.username if s.added_by else None,
         'optimization_id': s.optimization_history_id,
         'created_at': s.created_at.isoformat(),
+        'consumed_by': consumed_by,
+        'targeted_by': targeted_by,
     }
 
 
@@ -39,31 +49,59 @@ def _serialize_scrap(s):
 def list_inventory(request):
     """
     GET /api/inventory/
-    Query params: usability=usable|unusable|all, in_inventory=true|false,
+    Query params: usability=usable|unusable|used|all, in_inventory=true|false,
                   search=<scrap_id or parent_block_code>, page=1, page_size=20
     """
-    from .models import ScrapInventory
+    from .models import ScrapInventory, OptimizationHistory
     from django.db.models import Q
 
-    # Only show scraps that are manually added (no optimization_history) or whose parent optimization is executed.
-    qs = ScrapInventory.objects.filter(
-        Q(optimization_history__isnull=True) | Q(optimization_history__is_executed=True)
-    )
+    # Fetch mapping of consumed scrap IDs to their executed optimizations (non-revertible)
+    consumed_ids_to_run_info = {}
+    executed_runs = OptimizationHistory.objects.filter(is_executed=True)
+    for run in executed_runs:
+        ids = run.parameters.get('consumed_scrap_inventory_ids') or []
+        for cid in ids:
+            consumed_ids_to_run_info[cid] = {
+                'id': run.id,
+                'job_name': run.job_name
+            }
+
+    # Fetch mapping of scrap IDs to list of non-executed optimizations targeting them
+    targeting_ids_to_runs = {}
+    non_executed_runs = OptimizationHistory.objects.filter(is_executed=False)
+    for run in non_executed_runs:
+        ids = run.parameters.get('consumed_scrap_inventory_ids') or []
+        for cid in ids:
+            if cid not in targeting_ids_to_runs:
+                targeting_ids_to_runs[cid] = []
+            targeting_ids_to_runs[cid].append({
+                'id': run.id,
+                'job_name': run.job_name
+            })
 
     usability = request.GET.get('usability', 'usable')
-    if usability != 'all':
-        qs = qs.filter(usability=usability)
 
-    in_inventory = request.GET.get('in_inventory', 'true')
-    if in_inventory == 'true':
-        qs = qs.filter(is_in_inventory=True)
-    elif in_inventory == 'false':
-        qs = qs.filter(is_in_inventory=False)
+    if usability == 'used':
+        # Show scraps consumed by ANY executed optimization
+        qs = ScrapInventory.objects.filter(id__in=consumed_ids_to_run_info.keys())
+    else:
+        # Only show scraps that are manually added (no optimization_history) or whose parent optimization is executed,
+        # and exclude any scraps that have already been consumed by an executed optimization.
+        qs = ScrapInventory.objects.filter(
+            Q(optimization_history__isnull=True) | Q(optimization_history__is_executed=True)
+        ).exclude(id__in=consumed_ids_to_run_info.keys())
+        if usability != 'all':
+            qs = qs.filter(usability=usability)
+
+        in_inventory = request.GET.get('in_inventory', 'true')
+        if in_inventory == 'true':
+            qs = qs.filter(is_in_inventory=True)
+        elif in_inventory == 'false':
+            qs = qs.filter(is_in_inventory=False)
 
     # Search by scrap_id or parent_block_code (case-insensitive)
     search = request.GET.get('search', '').strip()
     if search:
-        from django.db.models import Q
         qs = qs.filter(
             Q(scrap_id__icontains=search) | Q(parent_block_code__icontains=search)
         )
@@ -83,7 +121,7 @@ def list_inventory(request):
     end = start + page_size
     items = qs.select_related('added_by')[start:end]
 
-    data = [_serialize_scrap(s) for s in items]
+    data = [_serialize_scrap(s, consumed_ids_to_run_info, targeting_ids_to_runs) for s in items]
     return Response({
         'success': True,
         'inventory': data,
