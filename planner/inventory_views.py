@@ -11,7 +11,7 @@ from django.db import IntegrityError
 MIN_USABLE_MM = 15.0  # scraps with any dim <= this are "unusable"
 
 
-def _serialize_scrap(s, consumed_info=None, targeting_info=None):
+def _serialize_scrap(s, consumed_info=None, targeting_info=None, history_map=None):
     consumed_by = None
     if consumed_info and s.id in consumed_info:
         consumed_by = consumed_info[s.id]
@@ -21,7 +21,14 @@ def _serialize_scrap(s, consumed_info=None, targeting_info=None):
         targeted_by = targeting_info[s.id]
 
     produced_by = None
-    if s.optimization_history:
+    if history_map is not None:
+        if s.optimization_history_id and s.optimization_history_id in history_map:
+            run = history_map[s.optimization_history_id]
+            produced_by = {
+                'id': run['id'],
+                'job_name': run['job_name']
+            }
+    elif s.optimization_history:
         produced_by = {
             'id': s.optimization_history.id,
             'job_name': s.optimization_history.job_name
@@ -58,33 +65,35 @@ def list_inventory(request):
     """
     GET /api/inventory/
     Query params: usability=usable|unusable|used|all, in_inventory=true|false,
-                  search=<scrap_id or parent_block_code>, page=1, page_size=20
+                  search=<scrap_id or parent_block_code>, sort_by=<field>, page=1, page_size=20
     """
     from .models import ScrapInventory, OptimizationHistory
     from django.db.models import Q
 
     # Fetch mapping of consumed scrap IDs to their executed optimizations (non-revertible)
     consumed_ids_to_run_info = {}
-    executed_runs = OptimizationHistory.objects.filter(is_executed=True)
+    executed_runs = OptimizationHistory.objects.filter(is_executed=True).values('id', 'job_name', 'parameters')
     for run in executed_runs:
-        ids = run.parameters.get('consumed_scrap_inventory_ids') or []
+        params = run.get('parameters') or {}
+        ids = params.get('consumed_scrap_inventory_ids') or []
         for cid in ids:
             consumed_ids_to_run_info[cid] = {
-                'id': run.id,
-                'job_name': run.job_name
+                'id': run['id'],
+                'job_name': run['job_name']
             }
 
     # Fetch mapping of scrap IDs to list of non-executed optimizations targeting them
     targeting_ids_to_runs = {}
-    non_executed_runs = OptimizationHistory.objects.filter(is_executed=False)
+    non_executed_runs = OptimizationHistory.objects.filter(is_executed=False).values('id', 'job_name', 'parameters')
     for run in non_executed_runs:
-        ids = run.parameters.get('consumed_scrap_inventory_ids') or []
+        params = run.get('parameters') or {}
+        ids = params.get('consumed_scrap_inventory_ids') or []
         for cid in ids:
             if cid not in targeting_ids_to_runs:
                 targeting_ids_to_runs[cid] = []
             targeting_ids_to_runs[cid].append({
-                'id': run.id,
-                'job_name': run.job_name
+                'id': run['id'],
+                'job_name': run['job_name']
             })
 
     usability = request.GET.get('usability', 'usable')
@@ -114,6 +123,42 @@ def list_inventory(request):
             Q(scrap_id__icontains=search) | Q(parent_block_code__icontains=search)
         )
 
+    # Sorting
+    sort_by = request.GET.get('sort_by', '-created_at').strip()
+    valid_sort_fields = {
+        'volume': 'volume',
+        '-volume': '-volume',
+        'length': 'length',
+        '-length': '-length',
+        'width': 'width',
+        '-width': '-width',
+        'height': 'height',
+        '-height': '-height',
+        'scrap_id': 'scrap_id',
+        '-scrap_id': '-scrap_id',
+        'parent_block_code': 'parent_block_code',
+        '-parent_block_code': '-parent_block_code',
+        'created_at': 'created_at',
+        '-created_at': '-created_at'
+    }
+    if sort_by in valid_sort_fields:
+        if sort_by == 'length':
+            qs = qs.order_by('length', 'width', 'height')
+        elif sort_by == '-length':
+            qs = qs.order_by('-length', '-width', '-height')
+        elif sort_by == 'width':
+            qs = qs.order_by('width', 'length', 'height')
+        elif sort_by == '-width':
+            qs = qs.order_by('-width', '-length', '-height')
+        elif sort_by == 'height':
+            qs = qs.order_by('height', 'length', 'width')
+        elif sort_by == '-height':
+            qs = qs.order_by('-height', '-length', '-width')
+        else:
+            qs = qs.order_by(sort_by)
+    else:
+        qs = qs.order_by('-created_at')
+
     # Pagination
     try:
         page = max(1, int(request.GET.get('page', 1)))
@@ -127,9 +172,17 @@ def list_inventory(request):
 
     start = (page - 1) * page_size
     end = start + page_size
-    items = qs.select_related('added_by', 'optimization_history')[start:end]
+    items = qs.select_related('added_by')[start:end]
 
-    data = [_serialize_scrap(s, consumed_ids_to_run_info, targeting_ids_to_runs) for s in items]
+    # Collect source optimization details efficiently without loading full large JSON rows
+    hist_ids = {s.optimization_history_id for s in items if s.optimization_history_id is not None}
+    history_map = {}
+    if hist_ids:
+        runs = OptimizationHistory.objects.filter(id__in=hist_ids).values('id', 'job_name')
+        for r in runs:
+            history_map[r['id']] = r
+
+    data = [_serialize_scrap(s, consumed_ids_to_run_info, targeting_ids_to_runs, history_map) for s in items]
     return Response({
         'success': True,
         'inventory': data,
