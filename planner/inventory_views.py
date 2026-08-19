@@ -19,6 +19,13 @@ def _serialize_scrap(s, consumed_info=None, targeting_info=None):
     targeted_by = []
     if targeting_info and s.id in targeting_info:
         targeted_by = targeting_info[s.id]
+
+    produced_by = None
+    if s.optimization_history:
+        produced_by = {
+            'id': s.optimization_history.id,
+            'job_name': s.optimization_history.job_name
+        }
         
     return {
         'id': s.id,
@@ -37,6 +44,7 @@ def _serialize_scrap(s, consumed_info=None, targeting_info=None):
         'created_at': s.created_at.isoformat(),
         'consumed_by': consumed_by,
         'targeted_by': targeted_by,
+        'produced_by': produced_by,
     }
 
 
@@ -119,7 +127,7 @@ def list_inventory(request):
 
     start = (page - 1) * page_size
     end = start + page_size
-    items = qs.select_related('added_by')[start:end]
+    items = qs.select_related('added_by', 'optimization_history')[start:end]
 
     data = [_serialize_scrap(s, consumed_ids_to_run_info, targeting_ids_to_runs) for s in items]
     return Response({
