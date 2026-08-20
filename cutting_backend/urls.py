@@ -26,6 +26,7 @@ from planner.inventory_views import (
     add_to_inventory,
     remove_from_inventory,
     update_scrap,
+    export_inventory_csv,
 )
 from planner.parent_block_views import (
     list_parent_blocks,
@@ -50,6 +51,7 @@ urlpatterns = [
     path("api/optimization-history/<int:history_id>/toggle-executed/", toggle_executed, name="toggle_executed"),
     path("api/optimization-history/<int:history_id>/label/", set_label, name="set_label"),
 
+    path("api/inventory/export/", export_inventory_csv, name="export_inventory_csv"),
     path("api/inventory/", list_inventory, name="list_inventory"),
     path("api/inventory/add/", add_to_inventory, name="add_to_inventory"),
     path("api/inventory/<int:scrap_pk>/remove/", remove_from_inventory, name="remove_from_inventory"),

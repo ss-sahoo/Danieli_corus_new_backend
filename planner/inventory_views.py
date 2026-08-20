@@ -7,6 +7,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 from django.db import IntegrityError
+import csv
+from django.http import StreamingHttpResponse
 
 MIN_USABLE_MM = 15.0  # scraps with any dim <= this are "unusable"
 
@@ -446,4 +448,135 @@ def update_scrap(request, scrap_pk):
         })
     except Exception as e:
         return Response({'detail': str(e)}, status=500)
+
+
+class Echo:
+    """An object that implements just the write method of the file-like
+    interface and returns the string written.
+    """
+    def write(self, value):
+        return value
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def export_inventory_csv(request):
+    """
+    GET /api/inventory/export/
+    Queries the database and streams a CSV of the inventory items based on current search and usability filters.
+    """
+    from .models import ScrapInventory, OptimizationHistory
+    from django.db.models import Q
+
+    # Fetch mapping of consumed scrap IDs to their executed optimizations (non-revertible)
+    consumed_ids_to_run_info = {}
+    executed_runs = OptimizationHistory.objects.filter(is_executed=True).values('id', 'job_name')
+    for run in executed_runs:
+        params = run.get('parameters') or {}
+        ids = params.get('consumed_scrap_inventory_ids') or []
+        for cid in ids:
+            consumed_ids_to_run_info[cid] = f"{run['job_name']} (#{run['id']})"
+
+    usability = request.GET.get('usability', 'all')
+
+    if usability == 'used':
+        # Show scraps consumed by ANY executed optimization
+        qs = ScrapInventory.objects.filter(id__in=consumed_ids_to_run_info.keys())
+    else:
+        # Only show scraps that are manually added (no optimization_history) or whose parent optimization is executed,
+        # and exclude any scraps that have already been consumed by an executed optimization.
+        qs = ScrapInventory.objects.filter(
+            Q(optimization_history__isnull=True) | Q(optimization_history__is_executed=True)
+        ).exclude(id__in=consumed_ids_to_run_info.keys())
+        if usability != 'all':
+            qs = qs.filter(usability=usability)
+
+        in_inventory = request.GET.get('in_inventory', 'true')
+        if in_inventory == 'true':
+            qs = qs.filter(is_in_inventory=True)
+        elif in_inventory == 'false':
+            qs = qs.filter(is_in_inventory=False)
+
+    # Search by scrap_id or parent_block_code (case-insensitive)
+    search = request.GET.get('search', '').strip()
+    if search:
+        qs = qs.filter(
+            Q(scrap_id__icontains=search) | Q(parent_block_code__icontains=search)
+        )
+
+    # Sorting
+    sort_by = request.GET.get('sort_by', '-created_at').strip()
+    valid_sort_fields = {
+        'volume': 'volume',
+        '-volume': '-volume',
+        'length': 'length',
+        '-length': '-length',
+        'width': 'width',
+        '-width': '-width',
+        'height': 'height',
+        '-height': '-height',
+        'scrap_id': 'scrap_id',
+        '-scrap_id': '-scrap_id',
+        'parent_block_code': 'parent_block_code',
+        '-parent_block_code': '-parent_block_code',
+        'created_at': 'created_at',
+        '-created_at': '-created_at'
+    }
+    if sort_by in valid_sort_fields:
+        if sort_by == 'length':
+            qs = qs.order_by('length', 'width', 'height')
+        elif sort_by == '-length':
+            qs = qs.order_by('-length', '-width', '-height')
+        elif sort_by == 'width':
+            qs = qs.order_by('width', 'length', 'height')
+        elif sort_by == '-width':
+            qs = qs.order_by('-width', '-length', '-height')
+        elif sort_by == 'height':
+            qs = qs.order_by('height', 'length', 'width')
+        elif sort_by == '-height':
+            qs = qs.order_by('-height', '-length', '-width')
+        else:
+            qs = qs.order_by(sort_by)
+    else:
+        qs = qs.order_by('-created_at')
+
+    # Prefetch optimization history and select_related added_by to prevent N+1 queries
+    qs = qs.select_related('added_by', 'optimization_history')
+
+    def rows_generator():
+        headers = [
+            'Scrap ID', 'Parent Block', 'Length (mm)', 'Width (mm)', 'Height (mm)',
+            'Volume (mm³)', 'Status', 'In Inventory', 'Added By',
+            'Produced By Run', 'Consumed By Run', 'Notes', 'Created At'
+        ]
+        
+        pseudo_buffer = Echo()
+        writer = csv.writer(pseudo_buffer)
+        yield writer.writerow(headers)
+
+        # Batch database queries using iterator() to keep memory usage minimal
+        for scrap in qs.iterator(chunk_size=1000):
+            produced_run = f"{scrap.optimization_history.job_name} (#{scrap.optimization_history.id})" if scrap.optimization_history else "manual/none"
+            consumed_run = consumed_ids_to_run_info.get(scrap.id, "")
+            
+            row = [
+                scrap.scrap_id,
+                scrap.parent_block_code,
+                scrap.length,
+                scrap.width,
+                scrap.height,
+                scrap.volume,
+                scrap.usability.upper(),
+                "Yes" if scrap.is_in_inventory else "No",
+                scrap.added_by.username if scrap.added_by else "system",
+                produced_run,
+                consumed_run,
+                scrap.notes,
+                scrap.created_at.strftime('%Y-%m-%d %H:%M:%S')
+            ]
+            yield writer.writerow(row)
+
+    response = StreamingHttpResponse(rows_generator(), content_type='text/csv')
+    response['Content-Disposition'] = 'attachment; filename="inventory_export.csv"'
+    return response
 
