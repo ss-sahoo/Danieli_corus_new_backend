@@ -593,5 +593,8 @@ def export_inventory_csv(request):
 
     response = StreamingHttpResponse(rows_generator(), content_type='text/csv')
     response['Content-Disposition'] = 'attachment; filename="inventory_export.csv"'
+    response['X-Total-Count'] = str(qs.count())
+    # Expose custom headers so the React client can access them
+    response['Access-Control-Expose-Headers'] = 'X-Total-Count, Content-Disposition'
     return response
 
