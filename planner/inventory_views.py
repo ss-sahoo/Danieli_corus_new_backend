@@ -459,14 +459,29 @@ class Echo:
 
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([]) # Enforced manually to support direct browser downloads via window.location.href
 def export_inventory_csv(request):
     """
     GET /api/inventory/export/
     Queries the database and streams a CSV of the inventory items based on current search and usability filters.
+    Supports either standard Authorization header OR passing token in query params (?token=...).
     """
     from .models import ScrapInventory, OptimizationHistory
     from django.db.models import Q
+    from rest_framework_simplejwt.authentication import JWTAuthentication
+
+    user = request.user
+    if not user or not user.is_authenticated:
+        token = request.GET.get('token')
+        if token:
+            try:
+                validated_token = JWTAuthentication().get_validated_token(token)
+                user = JWTAuthentication().get_user(validated_token)
+            except Exception:
+                return Response({'detail': 'Invalid or expired token.'}, status=401)
+
+        if not user or not user.is_authenticated:
+            return Response({'detail': 'Authentication credentials were not provided.'}, status=401)
 
     # Fetch mapping of consumed scrap IDs to their executed optimizations (non-revertible)
     consumed_ids_to_run_info = {}
