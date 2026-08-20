@@ -1721,7 +1721,14 @@ def upload_and_optimize(request):
             # Calculate efficiency
             if total_stock_volume > 0:
                 efficiency = (total_prism_volume / total_stock_volume) * 100
+            elif total_parts_packed > 0:
+                # Nothing was bought - the rack covered the whole job. No new steel was
+                # spent, so none of it went to waste. Falling through to 0 here reported
+                # the best possible outcome as 0% efficient and 100% waste.
+                efficiency = 100.0
             else:
+                # Bought nothing and packed nothing: that is no plan at all, not a
+                # perfect one.
                 efficiency = 0
 
             # How well all material in play was used, bought and recovered together.
@@ -3528,7 +3535,12 @@ def rerun_history_optimization(request, history_id):
                                     break
 
             total_stock_volume = sum(block.volume for block in new_blocks)
-            efficiency = (total_prism_volume / total_stock_volume * 100) if total_stock_volume > 0 else 0
+            if total_stock_volume > 0:
+                efficiency = total_prism_volume / total_stock_volume * 100
+            else:
+                # Bought nothing: the job came entirely off the rack, so no new steel was
+                # wasted. Only 0 when nothing was packed at all - see upload_and_optimize.
+                efficiency = 100.0 if total_parts_packed > 0 else 0
 
             blocks_info = []
             for block in helper.all_big_blocks:
